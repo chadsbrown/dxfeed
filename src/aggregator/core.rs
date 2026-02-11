@@ -6,15 +6,15 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::callsign::normalize_callsign;
-use crate::domain::{Band, DxMode, ModePolicy, OriginatorKind};
+use crate::domain::{ModePolicy, OriginatorKind};
 use crate::filter::compiled::FilterConfig;
 use crate::filter::config::CallsignNormalizationSerde;
 use crate::filter::decision::FilterDecision;
 use crate::filter::evaluate::evaluate;
 use crate::freq::{freq_bucket, freq_to_band, resolve_mode};
 use crate::model::{
-    DxEvent, DxSpot, DxSpotEvent, GeoResolved, OriginatorId, SkimQualityTag, SourceId,
-    SpotConfidence, SpotEventKind, SpotKey, SpotObservation, SpotView,
+    DxEvent, DxSpotEvent, GeoResolved, OriginatorId, SkimQualityTag, SourceId, SpotEventKind,
+    SpotKey, SpotObservation, SpotView,
 };
 use crate::parser::spot::{ParsedSpot, SkimmerFields};
 use crate::resolver::enrichment::EnrichmentResolver;
@@ -260,33 +260,13 @@ impl Aggregator {
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<DxEvent> {
         let mut events = Vec::new();
 
-        // Evict expired spots (Fix #7: emit Withdraw events)
-        let expired_keys = self.spot_table.evict_expired(now);
-        for key in expired_keys {
-            // We can't access the spot data anymore (it was evicted), so build
-            // a minimal Withdraw event from the key.
-            let spot = DxSpot {
-                spot_key: key,
-                dx_call: String::new(),
-                freq_hz: 0,
-                band: Band::Unknown,
-                mode: DxMode::Unknown,
-                first_seen: now,
-                last_seen: now,
-                spot_time: None,
-                comment: None,
-                observations: vec![],
-                unique_originators: 0,
-                unique_sources: 0,
-                skim_quality: None,
-                quality_detail: None,
-                confidence: SpotConfidence::default(),
-            };
-
+        // Evict expired spots and emit Withdraw events with full spot data
+        let expired = self.spot_table.evict_expired(now);
+        for (spot, revision) in expired {
             events.push(DxEvent::Spot(DxSpotEvent {
                 spot,
                 kind: SpotEventKind::Withdraw,
-                revision: 0,
+                revision,
             }));
         }
 

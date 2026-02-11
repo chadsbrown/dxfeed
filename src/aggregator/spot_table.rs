@@ -220,11 +220,12 @@ impl SpotTable {
 
     /// Evict all spots whose `last_seen` is older than TTL relative to `now`.
     ///
-    /// Returns the keys of evicted spots (for Withdraw event emission).
-    pub fn evict_expired(&mut self, now: DateTime<Utc>) -> Vec<SpotKey> {
+    /// Returns the spot data and revision of evicted spots (for Withdraw event
+    /// emission).
+    pub fn evict_expired(&mut self, now: DateTime<Utc>) -> Vec<(DxSpot, u32)> {
         let ttl_secs = self.config.ttl.as_secs() as i64;
 
-        let expired: Vec<SpotKey> = self
+        let expired_keys: Vec<SpotKey> = self
             .entries
             .iter()
             .filter(|(_, state)| {
@@ -233,11 +234,13 @@ impl SpotTable {
             .map(|(key, _)| key.clone())
             .collect();
 
-        for key in &expired {
-            self.entries.remove(key);
-        }
-
-        expired
+        expired_keys
+            .into_iter()
+            .filter_map(|key| {
+                let state = self.entries.remove(&key)?;
+                Some((state.spot, state.revision))
+            })
+            .collect()
     }
 
     pub fn get(&self, key: &SpotKey) -> Option<&SpotState> {
