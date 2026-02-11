@@ -1,3 +1,4 @@
+pub mod callsign;
 pub mod domain;
 pub mod filter;
 pub mod freq;
