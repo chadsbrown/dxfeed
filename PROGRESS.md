@@ -20,8 +20,10 @@
 
 - [x] Step 17: Enrichment resolver traits (318 tests with cty feature, 295 without)
 
+- [x] Step 18: Integration tests (306 tests total: 295 unit + 11 integration)
+
 ## Current Step
-Step 18: Integration tests
+Step 19: Hardening
 
 ## Applied Fixes (from review)
 - [x] Fix #1: Added CQ/ITU zone checks to eval_entity() and eval_geo() (Step 5)

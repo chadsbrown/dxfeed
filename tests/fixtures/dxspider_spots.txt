@@ -1,0 +1,20 @@
+DX de W3LPL:     14025.0  JA1ABC       CQ                         1830Z
+DX de VE3NEA:     7025.5  DL1ABC       CQ TEST                    1831Z
+DX de K1TTT:     21025.0  G3WCB        Loud signal                1832Z
+DX de N2IC:       3525.0  PY2SEX       cq dx                     1833Z
+DX de W1AW:     28025.0  VK3MO        CQ CQ                     1834Z
+DX de AA1K:     14195.0  EA3FHP       59 in MA                   1835Z
+DX de K1ZZ:     21295.0  ZS6EZ        55 good signal             1836Z
+DX de W2PE:      7195.0  F5IN         CQ contest                1837Z
+DX de N1MM:     14074.0  JA3YBK       FT8 -12 dB                1838Z
+DX de K3LR:     10136.0  LU1DK        FT8                        1839Z
+DX de W3LPL:    18100.0  ZL3CW        CQ                         1840Z
+DX de VE3NEA:   24950.0  VU2PTT       Good signal into NA        1841Z
+DX de K1TTT:    28480.0  CE3CT        FM simplex                 1842Z
+DX de N2IC:     50125.0  KH6HI        CQ 6m opening!             1843Z
+DX de W1AW:    144200.0  W6KA         EME                        1844Z
+DX de AA1K:      1825.0  OH2BH        CQ 160                    1845Z
+DX de K1ZZ:      5357.0  G4AMT        60m                        1846Z
+DX de W2PE:    14025.0  UA3TCJ       UP 2                       1847Z
+DX de N1MM:    14025.3  JA1ABC       CQ still going             1848Z
+DX de K3LR:     7025.7  DL1ABC       Strong in W3               1849Z

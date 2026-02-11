@@ -1,0 +1,10 @@
+DX de W3LPL:     14025.0  JA1ABC       CQ                    1830Z JA
+DX de VE3NEA:     7025.5  DL1ABC       CQ TEST               1831Z DL
+DX de K1TTT:     21025.0  G3WCB        Loud signal            1832Z G
+DX de N2IC:       3525.0  PY2SEX       cq dx                  1833Z PY
+DX de W1AW:     28025.0  VK3MO        CQ CQ                  1834Z VK
+DX de AA1K:     14195.0  EA3FHP       59 in MA                1835Z EA
+DX de K1ZZ:     21295.0  ZS6EZ        55 good signal          1836Z ZS
+DX de W2PE:      7195.0  F5IN         CQ contest              1837Z F
+DX de N1MM:     14074.0  JA3YBK       FT8 -12 dB             1838Z JA
+DX de K3LR:     10136.0  LU1DK        FT8                     1839Z LU
