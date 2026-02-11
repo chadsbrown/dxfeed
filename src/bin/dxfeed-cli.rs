@@ -144,6 +144,7 @@ struct App {
 }
 
 const MAX_ACTIVITY: usize = 500;
+const SPOT_MAX_AGE: Duration = Duration::from_secs(300); // 5 minutes
 
 impl App {
     fn new() -> Self {
@@ -250,6 +251,10 @@ impl App {
         }
     }
 
+    fn evict_stale_spots(&mut self) {
+        let cutoff = Utc::now() - SPOT_MAX_AGE;
+        self.active_spots.retain(|_, spot| spot.last_seen > cutoff);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +525,9 @@ async fn run_tui_loop(
                     }
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                app.evict_stale_spots();
+            }
         }
 
         if app.should_quit {
@@ -707,11 +714,14 @@ fn draw_spots(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let rows: Vec<Row> = spots[start..end]
         .iter()
         .map(|spot| {
-            let age = now
+            let first = now
                 .signed_duration_since(spot.first_seen)
                 .num_seconds()
                 .max(0) as u64;
-            let age_str = format_age(age);
+            let last = now
+                .signed_duration_since(spot.last_seen)
+                .num_seconds()
+                .max(0) as u64;
             let last_spotter = spot
                 .observations
                 .last()
@@ -725,7 +735,8 @@ fn draw_spots(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 Cell::from(format_band(spot.band)),
                 Cell::from(spot.dx_call.as_str().to_owned()),
                 Cell::from(truncate(last_spotter, 12).to_owned()),
-                Cell::from(age_str),
+                Cell::from(format_age(first)),
+                Cell::from(format_age(last)),
                 Cell::from(format!("{}", spot.observations.len())),
                 Cell::from(truncate(comment, 24).to_owned()),
             ])
@@ -738,7 +749,8 @@ fn draw_spots(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Cell::from("Band").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("DX Call").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Spotter").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Age").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("First").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Last").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Obs").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Comment").style(Style::default().add_modifier(Modifier::BOLD)),
     ])
@@ -750,6 +762,7 @@ fn draw_spots(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(5),
         Constraint::Length(14),
         Constraint::Length(13),
+        Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(4),
         Constraint::Fill(1),
