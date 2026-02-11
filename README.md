@@ -2,9 +2,6 @@
 
 **DX cluster spot aggregation for contest loggers.**
 
-![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-orange.svg)
-
 A Rust library that connects to one or more DX cluster nodes, aggregates
 spots with deduplication and frequency bucketing, applies configurable
 filters, classifies skimmer quality (CT1BOH/AR-Cluster style), resolves
