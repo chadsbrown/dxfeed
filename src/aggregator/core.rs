@@ -17,6 +17,7 @@ use crate::model::{
     SpotConfidence, SpotEventKind, SpotKey, SpotObservation, SpotView,
 };
 use crate::parser::spot::{ParsedSpot, RbnFields};
+use crate::resolver::enrichment::EnrichmentResolver;
 use crate::resolver::entity::EntityResolver;
 use crate::skimmer::config::SkimmerQualityConfig;
 use crate::skimmer::quality::SkimmerQualityEngine;
@@ -102,6 +103,7 @@ pub struct Aggregator {
     filter: FilterConfig,
     skimmer_engine: Option<SkimmerQualityEngine>,
     entity_resolver: Option<Box<dyn EntityResolver>>,
+    enrichment_resolver: Option<Box<dyn EnrichmentResolver>>,
     config: AggregatorConfig,
 }
 
@@ -111,6 +113,7 @@ impl Aggregator {
         skimmer_config: Option<SkimmerQualityConfig>,
         config: AggregatorConfig,
         entity_resolver: Option<Box<dyn EntityResolver>>,
+        enrichment_resolver: Option<Box<dyn EnrichmentResolver>>,
     ) -> Self {
         let spot_table = SpotTable::new(SpotTableConfig {
             ttl: config.spot_ttl,
@@ -124,6 +127,7 @@ impl Aggregator {
             filter,
             skimmer_engine,
             entity_resolver,
+            enrichment_resolver,
             config,
         }
     }
@@ -194,6 +198,18 @@ impl Aggregator {
                     state.dx_entity = resolver.resolve(&dx_call_norm);
                 }
                 state.spotter_entity = resolver.resolve(&spotter_call_norm);
+            }
+        }
+
+        // 5b. Resolve enrichment data (if resolver is available)
+        if let Some(resolver) = &self.enrichment_resolver {
+            if let Some(state) = self.spot_table.get_mut(&key) {
+                if state.lotw.is_none() {
+                    state.lotw = resolver.lotw_user(&dx_call_norm);
+                    state.in_master_db = resolver.in_master_db(&dx_call_norm);
+                    state.in_callbook = resolver.in_callbook(&dx_call_norm);
+                    state.memberships = resolver.memberships(&dx_call_norm);
+                }
             }
         }
 
@@ -345,10 +361,10 @@ impl Aggregator {
                 },
                 None => GeoResolved::default(),
             },
-            lotw: None,
-            in_master_db: None,
-            in_callbook: None,
-            memberships: None,
+            lotw: state.lotw,
+            in_master_db: state.in_master_db,
+            in_callbook: state.in_callbook,
+            memberships: state.memberships.as_ref(),
         }
     }
 
@@ -463,7 +479,7 @@ mod tests {
     }
 
     fn default_aggregator() -> Aggregator {
-        Aggregator::new(default_filter(), None, AggregatorConfig::default(), None)
+        Aggregator::new(default_filter(), None, AggregatorConfig::default(), None, None)
     }
 
     // -----------------------------------------------------------------------
@@ -507,7 +523,7 @@ mod tests {
         let mut config = AggregatorConfig::default();
         config.dedupe.emit_updates = true;
 
-        let mut agg = Aggregator::new(default_filter(), None, config, None);
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
 
         let obs1 = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
         let obs2 = make_obs("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human);
@@ -533,7 +549,7 @@ mod tests {
         filter_cfg.rf.band_deny.insert(Band::B20);
         let filter = filter_cfg.validate_and_compile().unwrap();
 
-        let mut agg = Aggregator::new(filter, None, AggregatorConfig::default(), None);
+        let mut agg = Aggregator::new(filter, None, AggregatorConfig::default(), None, None);
 
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
         let event = agg.process_observation(obs);
@@ -553,6 +569,7 @@ mod tests {
             Some(skim_cfg),
             AggregatorConfig::default(),
             None,
+            None,
         );
 
         // Single skimmer report → SkimUnknown → blocked
@@ -569,6 +586,7 @@ mod tests {
             default_filter(),
             Some(skim_cfg),
             AggregatorConfig::default(),
+            None,
             None,
         );
 
@@ -601,6 +619,7 @@ mod tests {
             Some(skim_cfg),
             AggregatorConfig::default(),
             None,
+            None,
         );
 
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "cluster1", OriginatorKind::Human);
@@ -616,7 +635,7 @@ mod tests {
     fn tick_evicts_expired_spots() {
         let mut config = AggregatorConfig::default();
         config.spot_ttl = Duration::from_secs(60);
-        let mut agg = Aggregator::new(default_filter(), None, config, None);
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
 
         let now = Utc::now();
         let old = now - chrono::Duration::seconds(120);
@@ -677,7 +696,7 @@ mod tests {
     fn revision_increments_across_observations() {
         let mut config = AggregatorConfig::default();
         config.dedupe.emit_updates = true;
-        let mut agg = Aggregator::new(default_filter(), None, config, None);
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
 
         let obs1 = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
         let obs2 = make_obs("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human);

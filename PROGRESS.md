@@ -18,8 +18,10 @@
 - [x] Step 15: DxFeedBuilder + top-level API + multi-source orchestration (290 tests cumulative)
 - [x] Step 16: Entity resolver trait + cty.dat parser (315 tests with cty feature)
 
+- [x] Step 17: Enrichment resolver traits (318 tests with cty feature, 295 without)
+
 ## Current Step
-Step 17: Enrichment resolver traits
+Step 18: Integration tests
 
 ## Applied Fixes (from review)
 - [x] Fix #1: Added CQ/ITU zone checks to eval_entity() and eval_geo() (Step 5)

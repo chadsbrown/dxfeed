@@ -17,6 +17,7 @@ use crate::filter::compiled::FilterConfig;
 use crate::filter::config::FilterConfigSerde;
 use crate::filter::error::FilterConfigError;
 use crate::model::DxEvent;
+use crate::resolver::enrichment::EnrichmentResolver;
 use crate::resolver::entity::EntityResolver;
 use crate::skimmer::config::SkimmerQualityConfig;
 use crate::source::SourceMessage;
@@ -49,6 +50,7 @@ pub struct DxFeedBuilder {
     aggregator_config: AggregatorConfig,
     skimmer_quality: Option<SkimmerQualityConfig>,
     entity_resolver: Option<Box<dyn EntityResolver>>,
+    enrichment_resolver: Option<Box<dyn EnrichmentResolver>>,
     backoff: BackoffConfig,
     source_channel_capacity: usize,
     event_channel_capacity: usize,
@@ -69,6 +71,7 @@ impl DxFeedBuilder {
             aggregator_config: AggregatorConfig::default(),
             skimmer_quality: None,
             entity_resolver: None,
+            enrichment_resolver: None,
             backoff: BackoffConfig::default(),
             source_channel_capacity: 256,
             event_channel_capacity: 256,
@@ -103,6 +106,12 @@ impl DxFeedBuilder {
     /// Set an entity (DXCC) resolver for geographic data.
     pub fn entity_resolver(mut self, resolver: Box<dyn EntityResolver>) -> Self {
         self.entity_resolver = Some(resolver);
+        self
+    }
+
+    /// Set an enrichment resolver (LoTW, master DB, callbook, memberships).
+    pub fn enrichment_resolver(mut self, resolver: Box<dyn EnrichmentResolver>) -> Self {
+        self.enrichment_resolver = Some(resolver);
         self
     }
 
@@ -175,6 +184,7 @@ impl DxFeedBuilder {
             self.aggregator_config,
             self.skimmer_quality,
             self.entity_resolver,
+            self.enrichment_resolver,
             agg_shutdown,
             self.tick_interval,
         ));
@@ -248,11 +258,12 @@ async fn run_aggregator_task(
     config: AggregatorConfig,
     skimmer_config: Option<SkimmerQualityConfig>,
     entity_resolver: Option<Box<dyn EntityResolver>>,
+    enrichment_resolver: Option<Box<dyn EnrichmentResolver>>,
     shutdown: CancellationToken,
     tick_interval: Duration,
 ) {
     let initial_filter = filter_rx.borrow_and_update().clone();
-    let mut aggregator = Aggregator::new(initial_filter, skimmer_config, config, entity_resolver);
+    let mut aggregator = Aggregator::new(initial_filter, skimmer_config, config, entity_resolver, enrichment_resolver);
     let mut tick = tokio::time::interval(tick_interval);
 
     loop {

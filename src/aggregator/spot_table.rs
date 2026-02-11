@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::domain::{Band, DxMode, OriginatorKind};
 use crate::model::{DxSpot, SpotConfidence, SpotKey, SpotObservation};
 use crate::resolver::entity::EntityInfo;
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -56,6 +57,14 @@ pub struct SpotState {
     pub dx_entity: Option<EntityInfo>,
     /// Resolved entity info for the most recent spotter (set by aggregator).
     pub spotter_entity: Option<EntityInfo>,
+    /// Enrichment: LoTW user status for the DX callsign.
+    pub lotw: Option<bool>,
+    /// Enrichment: whether the DX callsign appears in the master/SCP database.
+    pub in_master_db: Option<bool>,
+    /// Enrichment: whether the DX callsign appears in a callbook database.
+    pub in_callbook: Option<bool>,
+    /// Enrichment: club memberships for the DX callsign.
+    pub memberships: Option<BTreeSet<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +197,10 @@ impl SpotTable {
                 source_set,
                 dx_entity: None,
                 spotter_entity: None,
+                lotw: None,
+                in_master_db: None,
+                in_callbook: None,
+                memberships: None,
             };
 
             let key = input.key.clone();
