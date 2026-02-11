@@ -103,9 +103,15 @@ async fn basic_pipeline_dxspider_fixture() {
         "should have received some spots from DXSpider fixture"
     );
 
-    // All emitted should be New (no emit_updates by default)
+    // Non-withdraw emissions should be New (no emit_updates by default).
+    // QSY detection may produce Withdraw events when a station moves to a
+    // different frequency bucket on the same band/mode.
     for spot in &spots {
-        assert_eq!(spot.kind, SpotEventKind::New);
+        assert!(
+            spot.kind == SpotEventKind::New || spot.kind == SpotEventKind::Withdraw,
+            "unexpected event kind: {:?}",
+            spot.kind,
+        );
     }
 
     // Verify specific spots are present

@@ -39,6 +39,31 @@ impl Default for SpotTableConfig {
 }
 
 // ---------------------------------------------------------------------------
+// CallBandModeKey — secondary index key for QSY detection
+// ---------------------------------------------------------------------------
+
+/// Secondary key for tracking which frequency bucket a station is currently
+/// emitted on within a (call, band, mode) triple. Used by the aggregator to
+/// detect QSY events: when a station moves to a different frequency bucket
+/// on the same band/mode, the old spot is withdrawn first.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallBandModeKey {
+    pub dx_call_norm: String,
+    pub band: Band,
+    pub mode: DxMode,
+}
+
+impl From<&SpotKey> for CallBandModeKey {
+    fn from(key: &SpotKey) -> Self {
+        Self {
+            dx_call_norm: key.dx_call_norm.clone(),
+            band: key.band,
+            mode: key.mode,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SpotState — internal state for one aggregated spot
 // ---------------------------------------------------------------------------
 
@@ -111,6 +136,9 @@ pub struct IngestInput {
 /// In-memory table of aggregated spots, keyed by `SpotKey`.
 pub struct SpotTable {
     entries: HashMap<SpotKey, SpotState>,
+    /// Secondary index: maps (call, band, mode) → the currently-emitted SpotKey.
+    /// Used by the aggregator for QSY detection.
+    emitted_index: HashMap<CallBandModeKey, SpotKey>,
     config: SpotTableConfig,
 }
 
@@ -118,6 +146,7 @@ impl SpotTable {
     pub fn new(config: SpotTableConfig) -> Self {
         Self {
             entries: HashMap::new(),
+            emitted_index: HashMap::new(),
             config,
         }
     }
@@ -241,6 +270,11 @@ impl SpotTable {
             .into_iter()
             .filter_map(|key| {
                 let state = self.entries.remove(&key)?;
+                // Clean emitted index if it points to this evicted key
+                let cbm = CallBandModeKey::from(&key);
+                if self.emitted_index.get(&cbm) == Some(&key) {
+                    self.emitted_index.remove(&cbm);
+                }
                 Some((state.spot, state.revision))
             })
             .collect()
@@ -260,6 +294,31 @@ impl SpotTable {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    // -- Emitted index (QSY detection support) --------------------------------
+
+    /// Record that a spot at `key` has been emitted, updating the secondary
+    /// index so future QSY checks can find it.
+    pub fn register_emission(&mut self, key: &SpotKey) {
+        let cbm = CallBandModeKey::from(key);
+        self.emitted_index.insert(cbm, key.clone());
+    }
+
+    /// Look up the currently-emitted SpotKey for a (call, band, mode) triple.
+    pub fn lookup_emitted(&self, cbm: &CallBandModeKey) -> Option<&SpotKey> {
+        self.emitted_index.get(cbm)
+    }
+
+    /// Remove a spot from the table and clean up the emitted index if it
+    /// points to this key. Returns the spot data and revision if found.
+    pub fn remove_spot(&mut self, key: &SpotKey) -> Option<(DxSpot, u32)> {
+        let state = self.entries.remove(key)?;
+        let cbm = CallBandModeKey::from(key);
+        if self.emitted_index.get(&cbm) == Some(key) {
+            self.emitted_index.remove(&cbm);
+        }
+        Some((state.spot, state.revision))
     }
 
     /// Replace the spot table configuration at runtime.
@@ -283,6 +342,11 @@ impl SpotTable {
 
         if let Some(key) = oldest_key {
             self.entries.remove(&key);
+            // Clean emitted index if it points to this evicted key
+            let cbm = CallBandModeKey::from(&key);
+            if self.emitted_index.get(&cbm) == Some(&key) {
+                self.emitted_index.remove(&cbm);
+            }
         }
     }
 }
@@ -773,5 +837,78 @@ mod tests {
         let key = make_key("JA1ABC", 14_025_000, DxMode::CW);
         let state = table.get(&key).unwrap();
         assert_eq!(state.spot.comment.as_deref(), Some("CQ"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Emitted index (QSY support)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn emitted_index_register_and_lookup() {
+        let mut table = default_table();
+        let now = Utc::now();
+
+        let key = make_key("N9UNX", 7_043_000, DxMode::CW);
+        let input = make_input("N9UNX", 7_043_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, now);
+        table.ingest(input);
+        table.register_emission(&key);
+
+        let cbm = CallBandModeKey::from(&key);
+        assert_eq!(table.lookup_emitted(&cbm), Some(&key));
+
+        // Different call → not found
+        let other_cbm = CallBandModeKey {
+            dx_call_norm: "DL1ABC".into(),
+            band: Band::B40,
+            mode: DxMode::CW,
+        };
+        assert!(table.lookup_emitted(&other_cbm).is_none());
+    }
+
+    #[test]
+    fn emitted_index_cleaned_on_eviction() {
+        let mut table = SpotTable::new(SpotTableConfig {
+            ttl: Duration::from_secs(60),
+            ..Default::default()
+        });
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(120);
+
+        let key = make_key("N9UNX", 7_043_000, DxMode::CW);
+        let input = make_input("N9UNX", 7_043_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, old);
+        table.ingest(input);
+        table.register_emission(&key);
+
+        let cbm = CallBandModeKey::from(&key);
+        assert!(table.lookup_emitted(&cbm).is_some());
+
+        // Evict — should clean the index
+        table.evict_expired(now);
+        assert!(table.lookup_emitted(&cbm).is_none());
+    }
+
+    #[test]
+    fn remove_spot_returns_data_and_cleans_index() {
+        let mut table = default_table();
+        let now = Utc::now();
+
+        let key = make_key("N9UNX", 7_043_000, DxMode::CW);
+        let input = make_input("N9UNX", 7_043_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, now);
+        table.ingest(input);
+        table.register_emission(&key);
+
+        let cbm = CallBandModeKey::from(&key);
+        assert!(table.lookup_emitted(&cbm).is_some());
+
+        let removed = table.remove_spot(&key);
+        assert!(removed.is_some());
+        let (spot, rev) = removed.unwrap();
+        assert_eq!(spot.spot_key.dx_call_norm, "N9UNX");
+        assert_eq!(rev, 1);
+
+        // Index should be cleaned
+        assert!(table.lookup_emitted(&cbm).is_none());
+        assert!(table.is_empty());
     }
 }

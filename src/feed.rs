@@ -306,6 +306,16 @@ impl DxFeed {
             .send_modify(|c| c.dedupe.min_update_interval = interval);
     }
 
+    /// Toggle QSY detection at runtime.
+    ///
+    /// When enabled (default), a station moving to a different frequency
+    /// bucket within the same band/mode will produce a Withdraw for the
+    /// old spot followed by a New for the new spot.
+    pub fn set_detect_qsy(&self, detect: bool) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.dedupe.detect_qsy = detect);
+    }
+
     // -- Convenience setters (skimmer) --
 
     /// Toggle skimmer quality gating on or off.
@@ -372,7 +382,8 @@ async fn run_aggregator_task(
             msg = source_rx.recv() => {
                 match msg {
                     Some(SourceMessage::Observation(obs)) => {
-                        if let Some(event) = aggregator.process_observation(obs) {
+                        let events = aggregator.process_observation(obs);
+                        for event in events {
                             if event_tx.send(event).await.is_err() {
                                 return;
                             }

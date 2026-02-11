@@ -356,6 +356,7 @@ async fn main() {
         dedupe: DedupeConfig {
             emit_updates: true,
             min_update_interval: Some(Duration::from_secs(45)),
+            ..DedupeConfig::default()
         },
         ..AggregatorConfig::default()
     };

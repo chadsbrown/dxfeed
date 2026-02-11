@@ -22,7 +22,7 @@ use crate::resolver::entity::EntityResolver;
 use crate::skimmer::config::SkimmerQualityConfig;
 use crate::skimmer::quality::SkimmerQualityEngine;
 
-use super::spot_table::{IngestInput, SpotTable, SpotTableConfig, SpotTableResult};
+use super::spot_table::{CallBandModeKey, IngestInput, SpotTable, SpotTableConfig, SpotTableResult};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -47,7 +47,7 @@ impl Default for FreqBucketConfig {
 }
 
 /// Deduplication / emission control.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DedupeConfig {
     /// Emit Update events when a spot changes meaningfully.
     pub emit_updates: bool,
@@ -56,6 +56,20 @@ pub struct DedupeConfig {
     /// duration has elapsed since the last emission. `None` disables
     /// the cooldown (every qualifying Update is emitted immediately).
     pub min_update_interval: Option<Duration>,
+    /// When true (default), detect QSY: if a station already has an emitted
+    /// spot on this band/mode at a different frequency bucket, withdraw the
+    /// old spot before emitting the new one.
+    pub detect_qsy: bool,
+}
+
+impl Default for DedupeConfig {
+    fn default() -> Self {
+        Self {
+            emit_updates: false,
+            min_update_interval: None,
+            detect_qsy: true,
+        }
+    }
 }
 
 /// Full aggregator configuration.
@@ -143,9 +157,10 @@ impl Aggregator {
 
     /// Process an incoming observation through the full pipeline.
     ///
-    /// Returns a `DxEvent` if the spot should be emitted, or `None` if
-    /// suppressed by filtering, gating, or dedup.
-    pub fn process_observation(&mut self, obs: IncomingObservation) -> Option<DxEvent> {
+    /// Returns a `Vec<DxEvent>` — usually 0 or 1 events, but may return
+    /// `[Withdraw, New]` when QSY is detected (station changed frequency
+    /// bucket within the same band/mode).
+    pub fn process_observation(&mut self, obs: IncomingObservation) -> Vec<DxEvent> {
         let now = obs.received_at;
 
         // 1. Normalize callsigns
@@ -245,20 +260,54 @@ impl Aggregator {
         if let Some(engine) = &self.skimmer_engine {
             let tag = skim_tag.unwrap_or(SkimQualityTag::Unknown);
             if !engine.should_emit(tag, obs.originator_kind) {
-                return None;
+                return vec![];
             }
         }
 
         // 7. Build SpotView and apply general filter
-        let state = self.spot_table.get(&key)?;
+        let state = match self.spot_table.get(&key) {
+            Some(s) => s,
+            None => return vec![],
+        };
         let view = self.build_spot_view(state, &spotter_call_norm, &obs.source_id.0, obs.originator_kind, &skim, now);
 
         if let FilterDecision::Drop(_) = evaluate(&view, &self.filter) {
-            return None;
+            return vec![];
         }
 
         // 8. Decide emission: New vs Update vs suppress
-        self.decide_emission(&key, &table_result, now)
+        let base_event = self.decide_emission(&key, &table_result, now);
+        // -- mutable borrow from decide_emission is released here --
+
+        // 9. QSY detection: if a New spot was emitted and we already have an
+        //    emitted spot for this (call, band, mode) at a *different* freq
+        //    bucket, withdraw the old spot first.
+        if self.config.dedupe.detect_qsy {
+            if let Some(DxEvent::Spot(ref e)) = base_event {
+                if e.kind == SpotEventKind::New {
+                    let cbm = CallBandModeKey::from(&key);
+                    if let Some(old_key) = self.spot_table.lookup_emitted(&cbm).cloned() {
+                        if old_key != key {
+                            // QSY: withdraw old, emit new
+                            let mut events = Vec::with_capacity(2);
+                            if let Some((old_spot, old_rev)) = self.spot_table.remove_spot(&old_key) {
+                                events.push(DxEvent::Spot(DxSpotEvent {
+                                    spot: old_spot,
+                                    kind: SpotEventKind::Withdraw,
+                                    revision: old_rev,
+                                }));
+                            }
+                            self.spot_table.register_emission(&key);
+                            events.push(base_event.unwrap());
+                            return events;
+                        }
+                    }
+                    self.spot_table.register_emission(&key);
+                }
+            }
+        }
+
+        base_event.into_iter().collect()
     }
 
     /// Periodic maintenance: evict expired spots and return Withdraw events.
@@ -530,10 +579,10 @@ mod tests {
         let mut agg = default_aggregator();
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
 
-        let event = agg.process_observation(obs);
-        assert!(event.is_some());
+        let events = agg.process_observation(obs);
+        assert_eq!(events.len(), 1);
 
-        if let Some(DxEvent::Spot(e)) = event {
+        if let DxEvent::Spot(e) = &events[0] {
             assert_eq!(e.kind, SpotEventKind::New);
             assert_eq!(e.spot.dx_call, "JA1ABC");
             assert_eq!(e.revision, 1);
@@ -551,10 +600,10 @@ mod tests {
         let obs2 = make_obs("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human);
 
         let e1 = agg.process_observation(obs1);
-        assert!(e1.is_some());
+        assert_eq!(e1.len(), 1);
 
         let e2 = agg.process_observation(obs2);
-        assert!(e2.is_none()); // suppressed
+        assert!(e2.is_empty()); // suppressed
     }
 
     #[test]
@@ -569,8 +618,9 @@ mod tests {
 
         agg.process_observation(obs1);
         let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 1);
 
-        if let Some(DxEvent::Spot(e)) = e2 {
+        if let DxEvent::Spot(e) = &e2[0] {
             assert_eq!(e.kind, SpotEventKind::Update);
             assert_eq!(e.revision, 2);
         } else {
@@ -591,8 +641,8 @@ mod tests {
         let mut agg = Aggregator::new(filter, None, AggregatorConfig::default(), None, None);
 
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
-        let event = agg.process_observation(obs);
-        assert!(event.is_none());
+        let events = agg.process_observation(obs);
+        assert!(events.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -613,8 +663,8 @@ mod tests {
 
         // Single skimmer report → SkimUnknown → blocked
         let obs = make_obs("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer);
-        let event = agg.process_observation(obs);
-        assert!(event.is_none());
+        let events = agg.process_observation(obs);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -636,13 +686,13 @@ mod tests {
         let obs2 = make_obs_at("JA1ABC", "DK8JP-1", 14_025_050, "rbn", OriginatorKind::Skimmer, now);
         let obs3 = make_obs_at("JA1ABC", "VE3NEA-3", 14_025_100, "rbn", OriginatorKind::Skimmer, now);
 
-        assert!(agg.process_observation(obs1).is_none()); // Unknown → blocked
-        assert!(agg.process_observation(obs2).is_none()); // still Unknown
+        assert!(agg.process_observation(obs1).is_empty()); // Unknown → blocked
+        assert!(agg.process_observation(obs2).is_empty()); // still Unknown
 
         let e3 = agg.process_observation(obs3);
-        assert!(e3.is_some()); // Now Valid → emits
+        assert_eq!(e3.len(), 1); // Now Valid → emits
 
-        if let Some(DxEvent::Spot(e)) = e3 {
+        if let DxEvent::Spot(e) = &e3[0] {
             assert_eq!(e.kind, SpotEventKind::New);
         } else {
             panic!("expected Spot New event");
@@ -662,8 +712,8 @@ mod tests {
         );
 
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "cluster1", OriginatorKind::Human);
-        let event = agg.process_observation(obs);
-        assert!(event.is_some()); // Humans always pass gating
+        let events = agg.process_observation(obs);
+        assert_eq!(events.len(), 1); // Humans always pass gating
     }
 
     // -----------------------------------------------------------------------
@@ -703,9 +753,10 @@ mod tests {
         let mut agg = default_aggregator();
 
         let obs = make_obs("ja1abc", "w1aw", 14_025_000, "src1", OriginatorKind::Human);
-        let event = agg.process_observation(obs);
+        let events = agg.process_observation(obs);
+        assert_eq!(events.len(), 1);
 
-        if let Some(DxEvent::Spot(e)) = event {
+        if let DxEvent::Spot(e) = &events[0] {
             assert_eq!(e.spot.spot_key.dx_call_norm, "JA1ABC");
         } else {
             panic!("expected Spot event");
@@ -717,9 +768,10 @@ mod tests {
         let mut agg = default_aggregator();
 
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
-        let event = agg.process_observation(obs);
+        let events = agg.process_observation(obs);
+        assert_eq!(events.len(), 1);
 
-        if let Some(DxEvent::Spot(e)) = event {
+        if let DxEvent::Spot(e) = &events[0] {
             assert_eq!(e.spot.band, Band::B20);
             assert_eq!(e.spot.mode, DxMode::CW);
         } else {
@@ -769,7 +821,7 @@ mod tests {
 
         // Single skimmer report → Unknown → blocked
         let obs = make_obs("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer);
-        assert!(agg.process_observation(obs).is_none());
+        assert!(agg.process_observation(obs).is_empty());
 
         // Update config to allow_unknown = true
         let mut new_cfg = SkimmerQualityConfig::default();
@@ -778,7 +830,7 @@ mod tests {
 
         // Now a single skimmer report should pass gating
         let obs2 = make_obs("DL1ABC", "DK8JP-1", 21_025_000, "rbn", OriginatorKind::Skimmer);
-        assert!(agg.process_observation(obs2).is_some());
+        assert!(!agg.process_observation(obs2).is_empty());
     }
 
     #[test]
@@ -792,7 +844,7 @@ mod tests {
 
         // Now skimmer gating should block unknown spots
         let obs = make_obs("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer);
-        assert!(agg.process_observation(obs).is_none());
+        assert!(agg.process_observation(obs).is_empty());
     }
 
     #[test]
@@ -811,7 +863,7 @@ mod tests {
 
         // Now skimmer spots should pass through (no gating)
         let obs = make_obs("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer);
-        assert!(agg.process_observation(obs).is_some());
+        assert!(!agg.process_observation(obs).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -828,9 +880,9 @@ mod tests {
         let obs2 = make_obs("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human);
         let obs3 = make_obs("JA1ABC", "DL1ABC", 14_025_003, "src1", OriginatorKind::Human);
 
-        let e1 = agg.process_observation(obs1).unwrap();
-        let e2 = agg.process_observation(obs2).unwrap();
-        let e3 = agg.process_observation(obs3).unwrap();
+        let e1 = agg.process_observation(obs1).into_iter().next().unwrap();
+        let e2 = agg.process_observation(obs2).into_iter().next().unwrap();
+        let e3 = agg.process_observation(obs3).into_iter().next().unwrap();
 
         if let (DxEvent::Spot(s1), DxEvent::Spot(s2), DxEvent::Spot(s3)) = (e1, e2, e3) {
             assert_eq!(s1.revision, 1);
@@ -859,17 +911,19 @@ mod tests {
         // First observation → New (always emitted)
         let obs1 = make_obs_at("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human, t0);
         let e1 = agg.process_observation(obs1);
-        assert!(matches!(e1, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::New));
+        assert_eq!(e1.len(), 1);
+        assert!(matches!(&e1[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
 
         // Second observation 10s later → within cooldown → suppressed
         let obs2 = make_obs_at("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human, t10);
         let e2 = agg.process_observation(obs2);
-        assert!(e2.is_none(), "update within cooldown should be suppressed");
+        assert!(e2.is_empty(), "update within cooldown should be suppressed");
 
         // Third observation 35s after first → cooldown expired → Update emitted
         let obs3 = make_obs_at("JA1ABC", "DL1ABC", 14_025_003, "src1", OriginatorKind::Human, t35);
         let e3 = agg.process_observation(obs3);
-        assert!(matches!(e3, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
+        assert_eq!(e3.len(), 1);
+        assert!(matches!(&e3[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Update));
     }
 
     #[test]
@@ -884,7 +938,8 @@ mod tests {
 
         agg.process_observation(obs1);
         let e2 = agg.process_observation(obs2);
-        assert!(matches!(e2, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
+        assert_eq!(e2.len(), 1);
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Update));
     }
 
     #[test]
@@ -904,18 +959,186 @@ mod tests {
         let t15 = t0 + chrono::Duration::seconds(15);
         let obs2 = make_obs_at("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human, t15);
         let e2 = agg.process_observation(obs2);
-        assert!(matches!(e2, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
+        assert_eq!(e2.len(), 1);
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Update));
 
         // Update at t0+20s → suppressed (only 5s since last emission at t15)
         let t20 = t0 + chrono::Duration::seconds(20);
         let obs3 = make_obs_at("JA1ABC", "DL1ABC", 14_025_003, "src1", OriginatorKind::Human, t20);
         let e3 = agg.process_observation(obs3);
-        assert!(e3.is_none(), "should be within cooldown from last Update");
+        assert!(e3.is_empty(), "should be within cooldown from last Update");
 
         // Update at t0+26s → emitted (cooldown from t15 expired)
         let t26 = t0 + chrono::Duration::seconds(26);
         let obs4 = make_obs_at("JA1ABC", "K1ABC", 14_025_003, "src1", OriginatorKind::Human, t26);
         let e4 = agg.process_observation(obs4);
-        assert!(matches!(e4, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
+        assert_eq!(e4.len(), 1);
+        assert!(matches!(&e4[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Update));
+    }
+
+    // -----------------------------------------------------------------------
+    // QSY detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qsy_within_band_emits_withdraw_then_new() {
+        let mut agg = default_aggregator();
+
+        // First spot: N9UNX on 7.043 MHz (40m CW)
+        let obs1 = make_obs("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human);
+        let e1 = agg.process_observation(obs1);
+        assert_eq!(e1.len(), 1);
+        assert!(matches!(&e1[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+
+        // QSY: same call, same band/mode, different freq bucket (7.044 MHz)
+        let obs2 = make_obs("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 2, "should emit [Withdraw, New]");
+
+        // First event: Withdraw of old spot
+        if let DxEvent::Spot(w) = &e2[0] {
+            assert_eq!(w.kind, SpotEventKind::Withdraw);
+            assert_eq!(w.spot.spot_key.dx_call_norm, "N9UNX");
+            assert_eq!(w.spot.freq_hz, 7_043_000);
+        } else {
+            panic!("expected Withdraw event");
+        }
+
+        // Second event: New spot at new frequency
+        if let DxEvent::Spot(n) = &e2[1] {
+            assert_eq!(n.kind, SpotEventKind::New);
+            assert_eq!(n.spot.spot_key.dx_call_norm, "N9UNX");
+            assert_eq!(n.spot.freq_hz, 7_044_000);
+        } else {
+            panic!("expected New event");
+        }
+
+        // Old spot should be removed from the table
+        assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    #[test]
+    fn qsy_different_band_no_withdraw() {
+        let mut agg = default_aggregator();
+
+        // Spot on 40m CW
+        let obs1 = make_obs("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human);
+        let e1 = agg.process_observation(obs1);
+        assert_eq!(e1.len(), 1);
+
+        // Different band (20m CW) — NOT a QSY, independent spot
+        let obs2 = make_obs("N9UNX", "VE3NEA", 14_025_000, "src1", OriginatorKind::Human);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 1, "different band should just be a New");
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+
+        // Both spots should remain in the table
+        assert_eq!(agg.spot_table().len(), 2);
+    }
+
+    #[test]
+    fn qsy_disabled_no_withdraw() {
+        let mut config = AggregatorConfig::default();
+        config.dedupe.detect_qsy = false;
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        // First spot
+        let obs1 = make_obs("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human);
+        agg.process_observation(obs1);
+
+        // Different freq bucket on same band — should be independent New (no withdraw)
+        let obs2 = make_obs("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 1);
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+
+        // Both spots coexist
+        assert_eq!(agg.spot_table().len(), 2);
+    }
+
+    #[test]
+    fn qsy_only_triggers_after_gating() {
+        // With skimmer gating, a single unverified skimmer should NOT trigger QSY
+        let skim_cfg = SkimmerQualityConfig::default();
+        let mut agg = Aggregator::new(
+            default_filter(),
+            Some(skim_cfg),
+            AggregatorConfig::default(),
+            None,
+            None,
+        );
+
+        let now = Utc::now();
+
+        // First: establish a valid spot via 3 skimmers on 7.043
+        let obs1 = make_obs_at("N9UNX", "SKIM1", 7_043_000, "rbn", OriginatorKind::Skimmer, now);
+        let obs2 = make_obs_at("N9UNX", "SKIM2", 7_043_050, "rbn", OriginatorKind::Skimmer, now);
+        let obs3 = make_obs_at("N9UNX", "SKIM3", 7_043_080, "rbn", OriginatorKind::Skimmer, now);
+
+        assert!(agg.process_observation(obs1).is_empty());
+        assert!(agg.process_observation(obs2).is_empty());
+        let e3 = agg.process_observation(obs3);
+        assert_eq!(e3.len(), 1); // Valid → emits New
+
+        // Now a single skimmer at a different frequency — blocked by gating, no QSY
+        let obs4 = make_obs_at("N9UNX", "SKIM4", 7_044_000, "rbn", OriginatorKind::Skimmer, now);
+        let e4 = agg.process_observation(obs4);
+        assert!(e4.is_empty(), "unverified spot should not trigger QSY");
+
+        // Original spot still in table
+        assert_eq!(agg.spot_table().len(), 2); // both freq buckets ingested
+    }
+
+    #[test]
+    fn qsy_rapid_back_and_forth() {
+        let mut agg = default_aggregator();
+
+        // A on freq A
+        let obs1 = make_obs("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human);
+        let e1 = agg.process_observation(obs1);
+        assert_eq!(e1.len(), 1);
+
+        // A → freq B (QSY)
+        let obs2 = make_obs("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 2);
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
+        assert!(matches!(&e2[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+
+        // B → freq A (QSY back)
+        let obs3 = make_obs("N9UNX", "DL1ABC", 7_043_000, "src1", OriginatorKind::Human);
+        let e3 = agg.process_observation(obs3);
+        assert_eq!(e3.len(), 2);
+        assert!(matches!(&e3[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
+        assert!(matches!(&e3[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+
+        // Only one spot should exist in the table
+        assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    #[test]
+    fn qsy_eviction_cleans_index() {
+        let mut config = AggregatorConfig::default();
+        config.spot_ttl = Duration::from_secs(60);
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(120);
+
+        // Create an emitted spot (old timestamp)
+        let obs = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, old);
+        agg.process_observation(obs);
+
+        // Evict it via tick
+        let events = agg.tick(now);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
+
+        // Now a new spot at a different freq should NOT produce a QSY withdraw
+        // (old spot was already evicted and index cleaned)
+        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, now);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 1, "should just be New, no QSY withdraw");
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
     }
 }
