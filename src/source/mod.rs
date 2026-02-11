@@ -2,6 +2,7 @@
 
 pub mod iac;
 pub mod rbn;
+pub mod supervisor;
 pub mod telnet;
 
 use crate::aggregator::core::IncomingObservation;

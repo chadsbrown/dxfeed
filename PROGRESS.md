@@ -13,9 +13,11 @@
 - [x] Step 10: Skimmer quality module (246 tests cumulative)
 - [x] Step 11: Aggregator core (257 tests cumulative)
 - [x] Step 12: Telnet source connector (275 tests cumulative)
+- [x] Step 13: RBN source connector (278 tests cumulative)
+- [x] Step 14: Source supervision with backoff (283 tests cumulative)
 
 ## Current Step
-Step 13: RBN source connector
+Step 15: DxFeedBuilder + top-level API + multi-source orchestration
 
 ## Applied Fixes (from review)
 - [x] Fix #1: Added CQ/ITU zone checks to eval_entity() and eval_geo() (Step 5)
