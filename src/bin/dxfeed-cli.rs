@@ -355,6 +355,7 @@ async fn main() {
         spot_ttl: Duration::from_secs(cli.spot_ttl),
         dedupe: DedupeConfig {
             emit_updates: true,
+            min_update_interval: Some(Duration::from_secs(45)),
         },
         ..AggregatorConfig::default()
     };

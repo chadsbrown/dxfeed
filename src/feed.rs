@@ -298,6 +298,14 @@ impl DxFeed {
             .send_modify(|c| c.max_observations_per_spot = max);
     }
 
+    /// Set the minimum interval between Update emissions for the same spot.
+    ///
+    /// `None` disables the cooldown (every qualifying Update is emitted).
+    pub fn set_min_update_interval(&self, interval: Option<Duration>) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.dedupe.min_update_interval = interval);
+    }
+
     // -- Convenience setters (skimmer) --
 
     /// Toggle skimmer quality gating on or off.

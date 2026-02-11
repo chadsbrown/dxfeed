@@ -51,6 +51,8 @@ pub struct SpotState {
     pub last_emitted_revision: u32,
     /// Current revision (incremented on each new observation).
     pub revision: u32,
+    /// Timestamp of the last emitted event (New or Update) for cooldown.
+    pub last_emitted_at: Option<DateTime<Utc>>,
     /// Set of unique originator callsigns (all kinds).
     pub originator_set: HashSet<String>,
     /// Set of unique human originator callsigns.
@@ -201,6 +203,7 @@ impl SpotTable {
                 first_emitted: false,
                 last_emitted_revision: 0,
                 revision: 1,
+                last_emitted_at: None,
                 originator_set,
                 human_originator_set,
                 source_set,

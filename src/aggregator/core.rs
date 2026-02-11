@@ -51,6 +51,11 @@ impl Default for FreqBucketConfig {
 pub struct DedupeConfig {
     /// Emit Update events when a spot changes meaningfully.
     pub emit_updates: bool,
+    /// Minimum time between Update emissions for the same spot.
+    /// When set, Update events for a spot are suppressed until this
+    /// duration has elapsed since the last emission. `None` disables
+    /// the cooldown (every qualifying Update is emitted immediately).
+    pub min_update_interval: Option<Duration>,
 }
 
 /// Full aggregator configuration.
@@ -253,7 +258,7 @@ impl Aggregator {
         }
 
         // 8. Decide emission: New vs Update vs suppress
-        self.decide_emission(&key, &table_result)
+        self.decide_emission(&key, &table_result, now)
     }
 
     /// Periodic maintenance: evict expired spots and return Withdraw events.
@@ -391,14 +396,17 @@ impl Aggregator {
         &mut self,
         key: &SpotKey,
         table_result: &SpotTableResult,
+        now: DateTime<Utc>,
     ) -> Option<DxEvent> {
         let emit_updates = self.config.dedupe.emit_updates;
+        let min_update_interval = self.config.dedupe.min_update_interval;
         let state = self.spot_table.get_mut(key)?;
 
         match table_result {
             SpotTableResult::NewSpot(_) => {
                 state.first_emitted = true;
                 state.last_emitted_revision = state.revision;
+                state.last_emitted_at = Some(now);
 
                 Some(DxEvent::Spot(DxSpotEvent {
                     spot: state.spot.clone(),
@@ -411,6 +419,7 @@ impl Aggregator {
                     // Was filtered on all previous attempts; now passes — emit New
                     state.first_emitted = true;
                     state.last_emitted_revision = state.revision;
+                    state.last_emitted_at = Some(now);
 
                     return Some(DxEvent::Spot(DxSpotEvent {
                         spot: state.spot.clone(),
@@ -425,7 +434,18 @@ impl Aggregator {
 
                 // Meaningful change: any new observation since last emission
                 if state.revision > state.last_emitted_revision {
+                    // Enforce per-spot update cooldown
+                    if let Some(interval) = min_update_interval {
+                        if let Some(last_at) = state.last_emitted_at {
+                            let elapsed = now.signed_duration_since(last_at);
+                            if elapsed < chrono::Duration::from_std(interval).unwrap_or(chrono::Duration::MAX) {
+                                return None;
+                            }
+                        }
+                    }
+
                     state.last_emitted_revision = state.revision;
+                    state.last_emitted_at = Some(now);
 
                     Some(DxEvent::Spot(DxSpotEvent {
                         spot: state.spot.clone(),
@@ -819,5 +839,83 @@ mod tests {
         } else {
             panic!("expected Spot events");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Update cooldown
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_cooldown_suppresses_rapid_updates() {
+        let mut config = AggregatorConfig::default();
+        config.dedupe.emit_updates = true;
+        config.dedupe.min_update_interval = Some(Duration::from_secs(30));
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        let t0 = Utc::now();
+        let t10 = t0 + chrono::Duration::seconds(10);
+        let t35 = t0 + chrono::Duration::seconds(35);
+
+        // First observation → New (always emitted)
+        let obs1 = make_obs_at("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human, t0);
+        let e1 = agg.process_observation(obs1);
+        assert!(matches!(e1, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::New));
+
+        // Second observation 10s later → within cooldown → suppressed
+        let obs2 = make_obs_at("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human, t10);
+        let e2 = agg.process_observation(obs2);
+        assert!(e2.is_none(), "update within cooldown should be suppressed");
+
+        // Third observation 35s after first → cooldown expired → Update emitted
+        let obs3 = make_obs_at("JA1ABC", "DL1ABC", 14_025_003, "src1", OriginatorKind::Human, t35);
+        let e3 = agg.process_observation(obs3);
+        assert!(matches!(e3, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
+    }
+
+    #[test]
+    fn update_cooldown_none_disables_throttle() {
+        let mut config = AggregatorConfig::default();
+        config.dedupe.emit_updates = true;
+        config.dedupe.min_update_interval = None;
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        let obs1 = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
+        let obs2 = make_obs("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human);
+
+        agg.process_observation(obs1);
+        let e2 = agg.process_observation(obs2);
+        assert!(matches!(e2, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
+    }
+
+    #[test]
+    fn cooldown_resets_after_emitted_update() {
+        let mut config = AggregatorConfig::default();
+        config.dedupe.emit_updates = true;
+        config.dedupe.min_update_interval = Some(Duration::from_secs(10));
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        let t0 = Utc::now();
+
+        // New at t0
+        let obs1 = make_obs_at("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human, t0);
+        agg.process_observation(obs1);
+
+        // Update at t0+15s → emitted (cooldown from t0 expired)
+        let t15 = t0 + chrono::Duration::seconds(15);
+        let obs2 = make_obs_at("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human, t15);
+        let e2 = agg.process_observation(obs2);
+        assert!(matches!(e2, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
+
+        // Update at t0+20s → suppressed (only 5s since last emission at t15)
+        let t20 = t0 + chrono::Duration::seconds(20);
+        let obs3 = make_obs_at("JA1ABC", "DL1ABC", 14_025_003, "src1", OriginatorKind::Human, t20);
+        let e3 = agg.process_observation(obs3);
+        assert!(e3.is_none(), "should be within cooldown from last Update");
+
+        // Update at t0+26s → emitted (cooldown from t15 expired)
+        let t26 = t0 + chrono::Duration::seconds(26);
+        let obs4 = make_obs_at("JA1ABC", "K1ABC", 14_025_003, "src1", OriginatorKind::Human, t26);
+        let e4 = agg.process_observation(obs4);
+        assert!(matches!(e4, Some(DxEvent::Spot(ref e)) if e.kind == SpotEventKind::Update));
     }
 }
