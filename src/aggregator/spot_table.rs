@@ -23,6 +23,9 @@ pub struct SpotTableConfig {
     pub ttl: Duration,
     /// Maximum observations to keep per spot (default: 20).
     pub max_observations_per_spot: usize,
+    /// Hard cap on total number of spots in the table (default: 50_000).
+    /// When exceeded, the oldest spots (by last_seen) are evicted.
+    pub max_spots: usize,
 }
 
 impl Default for SpotTableConfig {
@@ -30,6 +33,7 @@ impl Default for SpotTableConfig {
         Self {
             ttl: Duration::from_secs(900),
             max_observations_per_spot: 20,
+            max_spots: 50_000,
         }
     }
 }
@@ -119,6 +123,11 @@ impl SpotTable {
     /// Ingest a new observation, creating or updating a spot.
     pub fn ingest(&mut self, input: IngestInput) -> SpotTableResult {
         let obs_time = input.observation.obs_time;
+
+        // Enforce hard cap: evict oldest spot if at limit and this is a new key
+        if !self.entries.contains_key(&input.key) && self.entries.len() >= self.config.max_spots {
+            self.evict_oldest_spot();
+        }
 
         if let Some(state) = self.entries.get_mut(&input.key) {
             state.revision += 1;
@@ -245,6 +254,19 @@ impl SpotTable {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Evict the spot with the oldest `last_seen` timestamp.
+    fn evict_oldest_spot(&mut self) {
+        let oldest_key = self
+            .entries
+            .iter()
+            .min_by_key(|(_, state)| state.spot.last_seen)
+            .map(|(k, _)| k.clone());
+
+        if let Some(key) = oldest_key {
+            self.entries.remove(&key);
+        }
     }
 }
 
@@ -599,6 +621,68 @@ mod tests {
         let key = make_key("JA1ABC", 14_025_000, DxMode::CW);
         let state = table.get(&key).unwrap();
         assert_eq!(state.spot.comment.as_deref(), Some("CQ TEST"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Hard cap enforcement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hard_cap_evicts_oldest_spot() {
+        let mut table = SpotTable::new(SpotTableConfig {
+            max_spots: 3,
+            ..Default::default()
+        });
+
+        let now = Utc::now();
+
+        // Insert 3 spots at staggered times
+        let t1 = now - chrono::Duration::seconds(30);
+        let t2 = now - chrono::Duration::seconds(20);
+        let t3 = now - chrono::Duration::seconds(10);
+
+        let input1 = make_input("CALL1", 14_025_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, t1);
+        let input2 = make_input("CALL2", 7_025_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, t2);
+        let input3 = make_input("CALL3", 21_025_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, t3);
+
+        table.ingest(input1);
+        table.ingest(input2);
+        table.ingest(input3);
+        assert_eq!(table.len(), 3);
+
+        // Insert a 4th — should evict CALL1 (oldest)
+        let input4 = make_input("CALL4", 3_525_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, now);
+        table.ingest(input4);
+        assert_eq!(table.len(), 3);
+
+        // CALL1 should be evicted
+        let key1 = make_key("CALL1", 14_025_000, DxMode::CW);
+        assert!(table.get(&key1).is_none(), "oldest spot should be evicted");
+
+        // CALL4 should be present
+        let key4 = make_key("CALL4", 3_525_000, DxMode::CW);
+        assert!(table.get(&key4).is_some(), "new spot should be present");
+    }
+
+    #[test]
+    fn updating_existing_spot_does_not_trigger_cap() {
+        let mut table = SpotTable::new(SpotTableConfig {
+            max_spots: 2,
+            ..Default::default()
+        });
+
+        let now = Utc::now();
+
+        let input1 = make_input("CALL1", 14_025_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, now);
+        let input2 = make_input("CALL2", 7_025_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, now);
+        table.ingest(input1);
+        table.ingest(input2);
+        assert_eq!(table.len(), 2);
+
+        // Update CALL1 (same key) — should NOT evict anything
+        let input3 = make_input("CALL1", 14_025_005, DxMode::CW, "VE3NEA", "src1", OriginatorKind::Human, now);
+        table.ingest(input3);
+        assert_eq!(table.len(), 2);
     }
 
     #[test]

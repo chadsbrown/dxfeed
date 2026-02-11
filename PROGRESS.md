@@ -22,8 +22,10 @@
 
 - [x] Step 18: Integration tests (306 tests total: 295 unit + 11 integration)
 
+- [x] Step 19: Hardening (318 tests total)
+
 ## Current Step
-Step 19: Hardening
+Complete! All 19 steps implemented.
 
 ## Applied Fixes (from review)
 - [x] Fix #1: Added CQ/ITU zone checks to eval_entity() and eval_geo() (Step 5)

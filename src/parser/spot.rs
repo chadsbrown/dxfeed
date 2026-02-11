@@ -99,8 +99,12 @@ pub fn parse_line(line: &str) -> ParsedLine {
 /// Try to parse a DX spot line. Returns None if it doesn't match.
 fn try_parse_dx_spot(line: &str) -> Option<ParsedSpot> {
     // Must start with "DX de " (case-insensitive)
-    let after_prefix = if line.len() >= 6 && line[..6].eq_ignore_ascii_case("DX de ") {
-        &line[6..]
+    let after_prefix = if let Some(prefix) = line.get(..6) {
+        if prefix.eq_ignore_ascii_case("DX de ") {
+            &line[6..]
+        } else {
+            return None;
+        }
     } else {
         return None;
     };
@@ -221,19 +225,41 @@ fn extract_comment_and_time(remainder: &str) -> (Option<String>, Option<NaiveTim
     let bytes = remainder.as_bytes();
     let len = bytes.len();
 
-    // Try to find HHMMz at the end
+    // Try to find HHMMz at the end (using .get() to handle non-ASCII safely)
     let (comment_end, time) = if len >= 5 {
-        // Check for HHMMz pattern (4 digits + 'Z'/'z')
-        let last5 = &remainder[len - 5..];
-        if last5.ends_with('Z') || last5.ends_with('z') {
-            if let Some(t) = parse_hhmm(&last5[..4]) {
-                (len - 5, Some(t))
+        if let Some(last5) = remainder.get(len - 5..) {
+            if last5.ends_with('Z') || last5.ends_with('z') {
+                if let Some(hhmm) = last5.get(..4) {
+                    if let Some(t) = parse_hhmm(hhmm) {
+                        (len - 5, Some(t))
+                    } else {
+                        (len, None)
+                    }
+                } else {
+                    (len, None)
+                }
+            } else if len >= 4 {
+                if let Some(last4) = remainder.get(len - 4..) {
+                    if last4.chars().all(|c| c.is_ascii_digit()) {
+                        if let Some(t) = parse_hhmm(last4) {
+                            (len - 4, Some(t))
+                        } else {
+                            (len, None)
+                        }
+                    } else {
+                        (len, None)
+                    }
+                } else {
+                    (len, None)
+                }
             } else {
                 (len, None)
             }
-        } else if len >= 4 {
-            // Try HHMM at the very end (no Z)
-            let last4 = &remainder[len - 4..];
+        } else {
+            (len, None)
+        }
+    } else if len >= 4 {
+        if let Some(last4) = remainder.get(len - 4..) {
             if last4.chars().all(|c| c.is_ascii_digit()) {
                 if let Some(t) = parse_hhmm(last4) {
                     (len - 4, Some(t))
@@ -246,23 +272,11 @@ fn extract_comment_and_time(remainder: &str) -> (Option<String>, Option<NaiveTim
         } else {
             (len, None)
         }
-    } else if len >= 4 {
-        // Short remainder, try HHMM
-        let last4 = &remainder[len - 4..];
-        if last4.chars().all(|c| c.is_ascii_digit()) {
-            if let Some(t) = parse_hhmm(last4) {
-                (len - 4, Some(t))
-            } else {
-                (len, None)
-            }
-        } else {
-            (len, None)
-        }
     } else {
         (len, None)
     };
 
-    let comment_str = remainder[..comment_end].trim();
+    let comment_str = remainder.get(..comment_end).unwrap_or(remainder).trim();
     let comment = if comment_str.is_empty() {
         None
     } else {
@@ -274,11 +288,11 @@ fn extract_comment_and_time(remainder: &str) -> (Option<String>, Option<NaiveTim
 
 /// Parse a 4-character HHMM string into a NaiveTime.
 fn parse_hhmm(s: &str) -> Option<NaiveTime> {
-    if s.len() != 4 || !s.chars().all(|c| c.is_ascii_digit()) {
+    if s.len() != 4 || !s.is_ascii() || !s.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let hour: u32 = s[..2].parse().ok()?;
-    let min: u32 = s[2..].parse().ok()?;
+    let hour: u32 = s.get(..2)?.parse().ok()?;
+    let min: u32 = s.get(2..)?.parse().ok()?;
     NaiveTime::from_hms_opt(hour, min, 0)
 }
 

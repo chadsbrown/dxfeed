@@ -62,6 +62,8 @@ pub struct AggregatorConfig {
     pub spot_ttl: Duration,
     pub max_observations_per_spot: usize,
     pub mode_policy: ModePolicy,
+    /// Hard cap on total number of spots in the table.
+    pub max_spots: usize,
 }
 
 impl Default for AggregatorConfig {
@@ -73,6 +75,7 @@ impl Default for AggregatorConfig {
             spot_ttl: Duration::from_secs(900),
             max_observations_per_spot: 20,
             mode_policy: ModePolicy::default(),
+            max_spots: 50_000,
         }
     }
 }
@@ -118,6 +121,7 @@ impl Aggregator {
         let spot_table = SpotTable::new(SpotTableConfig {
             ttl: config.spot_ttl,
             max_observations_per_spot: config.max_observations_per_spot,
+            max_spots: config.max_spots,
         });
 
         let skimmer_engine = skimmer_config.map(SkimmerQualityEngine::new);
