@@ -1,6 +1,7 @@
 //! Source connectors: telnet cluster and RBN ingest.
 
 pub mod iac;
+pub mod rbn;
 pub mod telnet;
 
 use crate::aggregator::core::IncomingObservation;
