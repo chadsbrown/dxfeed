@@ -21,15 +21,6 @@ use super::iac::strip_iac;
 use super::{SourceError, SourceMessage};
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Default RBN host.
-pub const RBN_DEFAULT_HOST: &str = "telnet.reversebeacon.net";
-/// Default RBN port.
-pub const RBN_DEFAULT_PORT: u16 = 7000;
-
-// ---------------------------------------------------------------------------
 // OriginatorPolicy
 // ---------------------------------------------------------------------------
 
@@ -81,22 +72,6 @@ impl ClusterSourceConfig {
         }
     }
 
-    /// Create a config pre-set for the Reverse Beacon Network.
-    ///
-    /// Uses the default RBN host/port and sets `originator_policy` to
-    /// `AllSkimmer` since all RBN spots come from automated skimmers.
-    pub fn rbn(callsign: impl Into<String>, source_id: SourceId) -> Self {
-        Self {
-            host: RBN_DEFAULT_HOST.into(),
-            port: RBN_DEFAULT_PORT,
-            callsign: callsign.into(),
-            password: None,
-            source_id,
-            login_timeout: Duration::from_secs(30),
-            read_timeout: Duration::from_secs(300),
-            originator_policy: OriginatorPolicy::AllSkimmer,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,60 +552,4 @@ mod tests {
         assert_eq!(observations[1].originator_kind, OriginatorKind::Human);
     }
 
-    #[tokio::test]
-    async fn rbn_constructor_tags_all_as_skimmer() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(b"Please enter your call:\r\n").await.unwrap();
-            let mut buf = [0u8; 64];
-            let _ = stream.read(&mut buf).await;
-            stream.write_all(b"Hello from RBN\r\n").await.unwrap();
-            stream.write_all(b"DX de W3LPL-2:   14025.0  JA1ABC       15 dB  22 WPM  CQ         1830Z\r\n").await.unwrap();
-            stream.write_all(b"DX de DK8JP-1:   14025.1  JA1ABC       12 dB  22 WPM  CQ         1830Z\r\n").await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            stream.shutdown().await.ok();
-        });
-
-        let mut config = ClusterSourceConfig::rbn("W1AW", SourceId("rbn-test".into()));
-        config.host = addr.ip().to_string();
-        config.port = addr.port();
-
-        let (tx, mut rx) = mpsc::channel(32);
-        let shutdown = CancellationToken::new();
-
-        tokio::spawn(run_cluster_source(config, tx, shutdown));
-
-        let mut observations = Vec::new();
-        while let Some(msg) = rx.recv().await {
-            if let SourceMessage::Observation(obs) = msg {
-                observations.push(obs);
-            }
-        }
-
-        server.await.unwrap();
-
-        assert_eq!(observations.len(), 2);
-        for obs in &observations {
-            assert_eq!(obs.originator_kind, OriginatorKind::Skimmer);
-            assert!(obs.skimmer_fields.is_some());
-        }
-
-        // Check skimmer fields parsed correctly
-        let fields = observations[0].skimmer_fields.as_ref().unwrap();
-        assert_eq!(fields.snr_db, Some(15));
-        assert_eq!(fields.wpm, Some(22));
-        assert!(fields.is_cq);
-    }
-
-    #[test]
-    fn rbn_constructor_defaults() {
-        let config = ClusterSourceConfig::rbn("W1AW", SourceId("rbn".into()));
-        assert_eq!(config.host, RBN_DEFAULT_HOST);
-        assert_eq!(config.port, RBN_DEFAULT_PORT);
-        assert!(matches!(config.originator_policy, OriginatorPolicy::AllSkimmer));
-        assert!(config.password.is_none());
-    }
 }

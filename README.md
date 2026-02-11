@@ -56,22 +56,6 @@ async fn main() {
 }
 ```
 
-### Connecting to RBN
-
-Use the `ClusterSourceConfig::rbn()` convenience constructor, which pre-sets
-the RBN host/port and `OriginatorPolicy::AllSkimmer`:
-
-```rust,no_run
-use dxfeed::model::SourceId;
-use dxfeed::source::cluster::ClusterSourceConfig;
-use dxfeed::source::supervisor::SourceConfig;
-
-let rbn = SourceConfig::Cluster(ClusterSourceConfig::rbn(
-    "W1AW",
-    SourceId("rbn".into()),
-));
-```
-
 ### Originator Policy
 
 `ClusterSourceConfig` includes an `originator_policy` field that controls
@@ -277,7 +261,7 @@ A test harness binary is available behind the `cli` feature:
 
 ```sh
 cargo run --features cli -- --callsign W1AW connect dx.example.com 7300
-cargo run --features cli -- --callsign W1AW connect telnet.reversebeacon.net 7000 --originator-policy all-skimmer
+cargo run --features cli -- --callsign W1AW connect dx.example.com 7300 --originator-policy all-skimmer
 cargo run --features cli -- --callsign W1AW --json --emit-updates connect dx.example.com 7300
 cargo run --features cli -- --dump-default-filter > filter.json
 ```
