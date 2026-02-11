@@ -308,6 +308,41 @@ impl Aggregator {
         self.filter = filter;
     }
 
+    /// Replace the aggregator configuration at runtime.
+    ///
+    /// Cascades relevant settings to the spot table (TTL, max_spots,
+    /// max_observations_per_spot).
+    ///
+    /// **Warning:** Changing `freq_bucket`, `callsign_norm`, or `mode_policy`
+    /// at runtime will cause new observations to hash to different `SpotKey`s
+    /// than existing spots. The consumer is responsible for understanding this
+    /// effect.
+    pub fn update_aggregator_config(&mut self, config: AggregatorConfig) {
+        let table_config = SpotTableConfig {
+            ttl: config.spot_ttl,
+            max_observations_per_spot: config.max_observations_per_spot,
+            max_spots: config.max_spots,
+        };
+        self.spot_table.update_config(table_config);
+        self.config = config;
+    }
+
+    /// Replace or toggle the skimmer quality engine at runtime.
+    ///
+    /// - `Some(cfg)` with an existing engine: updates the engine's config.
+    /// - `Some(cfg)` with no engine and `cfg.enabled`: creates a new engine.
+    /// - `None`: disables the engine entirely.
+    pub fn update_skimmer_config(&mut self, config: Option<SkimmerQualityConfig>) {
+        match (&mut self.skimmer_engine, config) {
+            (Some(engine), Some(cfg)) => engine.update_config(cfg),
+            (None, Some(cfg)) if cfg.enabled => {
+                self.skimmer_engine = Some(SkimmerQualityEngine::new(cfg));
+            }
+            (Some(_), None) => self.skimmer_engine = None,
+            _ => {}
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -690,6 +725,93 @@ mod tests {
         } else {
             panic!("expected Spot event");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Revision tracking
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // update_aggregator_config / update_skimmer_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_aggregator_config_cascades_to_table() {
+        let mut agg = default_aggregator();
+        let now = Utc::now();
+
+        // Insert a spot with default TTL (900s)
+        let old = now - chrono::Duration::seconds(120);
+        let obs = make_obs_at("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human, old);
+        agg.process_observation(obs);
+        assert_eq!(agg.spot_table().len(), 1);
+
+        // Reduce TTL to 60s — the spot is 120s old, so tick should evict it
+        let mut config = AggregatorConfig::default();
+        config.spot_ttl = Duration::from_secs(60);
+        agg.update_aggregator_config(config);
+
+        let events = agg.tick(now);
+        assert_eq!(agg.spot_table().len(), 0);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn update_skimmer_config_changes_gating() {
+        let skim_cfg = SkimmerQualityConfig::default();
+        let mut agg = Aggregator::new(
+            default_filter(),
+            Some(skim_cfg),
+            AggregatorConfig::default(),
+            None,
+            None,
+        );
+
+        // Single skimmer report → Unknown → blocked
+        let obs = make_obs("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer);
+        assert!(agg.process_observation(obs).is_none());
+
+        // Update config to allow_unknown = true
+        let mut new_cfg = SkimmerQualityConfig::default();
+        new_cfg.allow_unknown = true;
+        agg.update_skimmer_config(Some(new_cfg));
+
+        // Now a single skimmer report should pass gating
+        let obs2 = make_obs("DL1ABC", "DK8JP-1", 21_025_000, "rbn", OriginatorKind::Skimmer);
+        assert!(agg.process_observation(obs2).is_some());
+    }
+
+    #[test]
+    fn update_skimmer_config_creates_engine() {
+        // Start with no skimmer engine
+        let mut agg = default_aggregator();
+
+        // Enabling skimmer config should create the engine
+        let skim_cfg = SkimmerQualityConfig::default();
+        agg.update_skimmer_config(Some(skim_cfg));
+
+        // Now skimmer gating should block unknown spots
+        let obs = make_obs("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer);
+        assert!(agg.process_observation(obs).is_none());
+    }
+
+    #[test]
+    fn update_skimmer_config_disables_engine() {
+        let skim_cfg = SkimmerQualityConfig::default();
+        let mut agg = Aggregator::new(
+            default_filter(),
+            Some(skim_cfg),
+            AggregatorConfig::default(),
+            None,
+            None,
+        );
+
+        // Disable the engine
+        agg.update_skimmer_config(None);
+
+        // Now skimmer spots should pass through (no gating)
+        let obs = make_obs("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer);
+        assert!(agg.process_observation(obs).is_some());
     }
 
     // -----------------------------------------------------------------------

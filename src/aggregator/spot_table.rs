@@ -256,6 +256,17 @@ impl SpotTable {
         self.entries.is_empty()
     }
 
+    /// Replace the spot table configuration at runtime.
+    ///
+    /// If `max_spots` was reduced, excess spots are evicted immediately
+    /// (oldest by `last_seen`).
+    pub fn update_config(&mut self, config: SpotTableConfig) {
+        self.config = config;
+        while self.entries.len() > self.config.max_spots {
+            self.evict_oldest_spot();
+        }
+    }
+
     /// Evict the spot with the oldest `last_seen` timestamp.
     fn evict_oldest_spot(&mut self) {
         let oldest_key = self
@@ -683,6 +694,61 @@ mod tests {
         let input3 = make_input("CALL1", 14_025_005, DxMode::CW, "VE3NEA", "src1", OriginatorKind::Human, now);
         table.ingest(input3);
         assert_eq!(table.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // update_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_config_changes_ttl() {
+        let mut table = SpotTable::new(SpotTableConfig {
+            ttl: Duration::from_secs(60),
+            ..Default::default()
+        });
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(90);
+
+        let input = make_input("JA1ABC", 14_025_000, DxMode::CW, "W1AW", "src1", OriginatorKind::Human, old);
+        table.ingest(input);
+        assert_eq!(table.len(), 1);
+
+        // With 60s TTL the spot is expired; extend to 120s and it should survive
+        table.update_config(SpotTableConfig {
+            ttl: Duration::from_secs(120),
+            ..Default::default()
+        });
+        let expired = table.evict_expired(now);
+        assert!(expired.is_empty());
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn update_config_reduces_max_spots() {
+        let mut table = SpotTable::new(SpotTableConfig::default());
+        let now = Utc::now();
+
+        for i in 0..5 {
+            let input = make_input(
+                &format!("CALL{i}"),
+                14_025_000 + i * 100_000,
+                DxMode::CW,
+                "W1AW",
+                "src1",
+                OriginatorKind::Human,
+                now + chrono::Duration::seconds(i as i64),
+            );
+            table.ingest(input);
+        }
+        assert_eq!(table.len(), 5);
+
+        // Reduce max_spots to 3 — oldest 2 should be evicted immediately
+        table.update_config(SpotTableConfig {
+            max_spots: 3,
+            ..Default::default()
+        });
+        assert_eq!(table.len(), 3);
     }
 
     #[test]

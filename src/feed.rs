@@ -160,6 +160,14 @@ impl DxFeedBuilder {
         // Filter hot-reload channel
         let (filter_tx, filter_rx) = watch::channel(compiled_filter);
 
+        // Aggregator config hot-reload channel
+        let (aggregator_config_tx, aggregator_config_rx) =
+            watch::channel(self.aggregator_config.clone());
+
+        // Skimmer config hot-reload channel
+        let (skimmer_config_tx, skimmer_config_rx) =
+            watch::channel(self.skimmer_quality.clone());
+
         // Spawn source supervisor tasks
         let mut source_handles = Vec::new();
         for source in self.sources {
@@ -181,6 +189,8 @@ impl DxFeedBuilder {
             source_rx,
             event_tx,
             filter_rx,
+            aggregator_config_rx,
+            skimmer_config_rx,
             self.aggregator_config,
             self.skimmer_quality,
             self.entity_resolver,
@@ -193,6 +203,8 @@ impl DxFeedBuilder {
             event_rx,
             shutdown,
             filter_tx,
+            aggregator_config_tx,
+            skimmer_config_tx,
             _source_handles: source_handles,
             _aggregator_handle: aggregator_handle,
         })
@@ -211,6 +223,8 @@ pub struct DxFeed {
     event_rx: mpsc::Receiver<DxEvent>,
     shutdown: CancellationToken,
     filter_tx: watch::Sender<FilterConfig>,
+    aggregator_config_tx: watch::Sender<AggregatorConfig>,
+    skimmer_config_tx: watch::Sender<Option<SkimmerQualityConfig>>,
     _source_handles: Vec<JoinHandle<()>>,
     _aggregator_handle: JoinHandle<()>,
 }
@@ -240,6 +254,79 @@ impl DxFeed {
         Ok(())
     }
 
+    /// Replace the entire aggregator configuration at runtime.
+    ///
+    /// **Warning:** Changing `freq_bucket`, `callsign_norm`, or `mode_policy`
+    /// causes new observations to hash to different `SpotKey`s than existing
+    /// spots. Only TTL, dedup, and cap settings are safe to change freely.
+    pub fn update_aggregator_config(&self, config: AggregatorConfig) {
+        let _ = self.aggregator_config_tx.send(config);
+    }
+
+    /// Replace the skimmer quality configuration at runtime.
+    pub fn update_skimmer_config(&self, config: SkimmerQualityConfig) {
+        let _ = self.skimmer_config_tx.send(Some(config));
+    }
+
+    /// Disable the skimmer quality engine at runtime.
+    pub fn disable_skimmer_quality(&self) {
+        let _ = self.skimmer_config_tx.send(None);
+    }
+
+    // -- Convenience setters (aggregator) --
+
+    /// Change the spot TTL without replacing the entire config.
+    pub fn set_spot_ttl(&self, ttl: Duration) {
+        self.aggregator_config_tx.send_modify(|c| c.spot_ttl = ttl);
+    }
+
+    /// Toggle emission of `Update` events at runtime.
+    pub fn set_emit_updates(&self, emit: bool) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.dedupe.emit_updates = emit);
+    }
+
+    /// Change the hard cap on total spots in the table.
+    pub fn set_max_spots(&self, max: usize) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.max_spots = max);
+    }
+
+    /// Change the maximum observations kept per spot.
+    pub fn set_max_observations_per_spot(&self, max: usize) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.max_observations_per_spot = max);
+    }
+
+    // -- Convenience setters (skimmer) --
+
+    /// Toggle skimmer quality gating on or off.
+    pub fn set_skimmer_gate(&self, gate: bool) {
+        self.skimmer_config_tx.send_modify(|c| {
+            if let Some(cfg) = c {
+                cfg.gate_skimmer_output = gate;
+            }
+        });
+    }
+
+    /// Toggle whether unverified (Unknown) skimmer spots are allowed.
+    pub fn set_allow_unverified(&self, allow: bool) {
+        self.skimmer_config_tx.send_modify(|c| {
+            if let Some(cfg) = c {
+                cfg.allow_unknown = allow;
+            }
+        });
+    }
+
+    /// Change the number of distinct skimmers required for Valid status.
+    pub fn set_required_distinct_skimmers(&self, count: u8) {
+        self.skimmer_config_tx.send_modify(|c| {
+            if let Some(cfg) = c {
+                cfg.valid_required_distinct_skimmers = count;
+            }
+        });
+    }
+
     /// Returns `true` if shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.is_cancelled()
@@ -255,6 +342,8 @@ async fn run_aggregator_task(
     mut source_rx: mpsc::Receiver<SourceMessage>,
     event_tx: mpsc::Sender<DxEvent>,
     mut filter_rx: watch::Receiver<FilterConfig>,
+    mut aggregator_config_rx: watch::Receiver<AggregatorConfig>,
+    mut skimmer_config_rx: watch::Receiver<Option<SkimmerQualityConfig>>,
     config: AggregatorConfig,
     skimmer_config: Option<SkimmerQualityConfig>,
     entity_resolver: Option<Box<dyn EntityResolver>>,
@@ -263,6 +352,10 @@ async fn run_aggregator_task(
     tick_interval: Duration,
 ) {
     let initial_filter = filter_rx.borrow_and_update().clone();
+    // Mark initial values as seen so we don't fire immediately
+    aggregator_config_rx.borrow_and_update();
+    skimmer_config_rx.borrow_and_update();
+
     let mut aggregator = Aggregator::new(initial_filter, skimmer_config, config, entity_resolver, enrichment_resolver);
     let mut tick = tokio::time::interval(tick_interval);
 
@@ -298,6 +391,18 @@ async fn run_aggregator_task(
                 if result.is_ok() {
                     let new_filter = filter_rx.borrow_and_update().clone();
                     aggregator.update_filter(new_filter);
+                }
+            }
+            result = aggregator_config_rx.changed() => {
+                if result.is_ok() {
+                    let new_config = aggregator_config_rx.borrow_and_update().clone();
+                    aggregator.update_aggregator_config(new_config);
+                }
+            }
+            result = skimmer_config_rx.changed() => {
+                if result.is_ok() {
+                    let new_config = skimmer_config_rx.borrow_and_update().clone();
+                    aggregator.update_skimmer_config(new_config);
                 }
             }
             _ = shutdown.cancelled() => {
@@ -581,6 +686,105 @@ mod tests {
         feed.shutdown();
         server.await.unwrap();
         assert!(!second_spot, "second spot should be blocked by updated filter");
+    }
+
+    #[tokio::test]
+    async fn hot_reload_emit_updates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"login:\r\n").await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = stream.read(&mut buf).await;
+            stream.write_all(b"Welcome\r\n").await.unwrap();
+
+            // First spot
+            stream
+                .write_all(
+                    b"DX de W3LPL:     14025.0  JA1ABC       CQ                         1830Z\r\n",
+                )
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Second spot — same callsign+freq bucket, different spotter (Update candidate)
+            stream
+                .write_all(
+                    b"DX de VE3NEA:    14025.0  JA1ABC       CQ TEST                    1831Z\r\n",
+                )
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream.shutdown().await.ok();
+        });
+
+        let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "W1AW",
+            SourceId("test".into()),
+        ));
+
+        let mut feed = DxFeedBuilder::new()
+            .add_source(config)
+            .set_backoff(fast_backoff())
+            .tick_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+
+        // Wait for first New spot
+        let mut got_new = false;
+        let timeout = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                event = feed.next_event() => {
+                    match event {
+                        Some(DxEvent::Spot(e)) if e.kind == SpotEventKind::New => {
+                            got_new = true;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                _ = &mut timeout => break,
+            }
+        }
+        assert!(got_new, "should receive first New spot");
+
+        // Enable emit_updates via hot-reload
+        feed.set_emit_updates(true);
+
+        // Wait for Update event
+        let mut got_update = false;
+        let timeout2 = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(timeout2);
+
+        loop {
+            tokio::select! {
+                event = feed.next_event() => {
+                    match event {
+                        Some(DxEvent::Spot(e)) if e.kind == SpotEventKind::Update => {
+                            got_update = true;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                _ = &mut timeout2 => break,
+            }
+        }
+
+        feed.shutdown();
+        server.await.unwrap();
+        assert!(got_update, "should receive Update after enabling emit_updates");
     }
 
     #[tokio::test]

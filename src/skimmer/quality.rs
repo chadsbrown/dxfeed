@@ -53,6 +53,17 @@ impl SkimmerQualityEngine {
         }
     }
 
+    /// Replace the skimmer quality configuration at runtime.
+    ///
+    /// If `max_tracked_observations` was reduced, excess observations are
+    /// evicted immediately (oldest groups first).
+    pub fn update_config(&mut self, config: SkimmerQualityConfig) {
+        self.config = config;
+        while self.total_observations > self.config.max_tracked_observations {
+            self.evict_oldest_entries();
+        }
+    }
+
     /// Record a skimmer observation for a DX callsign.
     pub fn record_observation(
         &mut self,
@@ -612,6 +623,59 @@ mod tests {
         let engine = SkimmerQualityEngine::new(config);
         assert!(engine.should_emit(SkimQualityTag::Unknown, OriginatorKind::Skimmer));
         assert!(engine.should_emit(SkimQualityTag::Busted, OriginatorKind::Skimmer));
+    }
+
+    // -----------------------------------------------------------------------
+    // update_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_config_changes_thresholds() {
+        let mut engine = default_engine();
+        let now = Utc::now();
+
+        // Two distinct skimmers — default requires 3 for Valid
+        engine.record_observation("JA1ABC", 14_025_000, "W3LPL-2", now);
+        engine.record_observation("JA1ABC", 14_025_050, "DK8JP-1", now);
+        let tag = engine.compute_tag("JA1ABC", 14_025_000, now);
+        assert_eq!(tag, SkimQualityTag::Unknown);
+
+        // Lower threshold to 2 — should now be Valid
+        let mut new_config = SkimmerQualityConfig::default();
+        new_config.valid_required_distinct_skimmers = 2;
+        engine.update_config(new_config);
+
+        let tag = engine.compute_tag("JA1ABC", 14_025_000, now);
+        assert_eq!(tag, SkimQualityTag::Valid);
+    }
+
+    #[test]
+    fn update_config_reduces_max_observations() {
+        let mut engine = SkimmerQualityEngine::new(SkimmerQualityConfig {
+            max_tracked_observations: 100,
+            ..Default::default()
+        });
+        let now = Utc::now();
+
+        // Record observations for 10 different callsigns (5 each = 50 total)
+        for i in 0..10 {
+            for j in 0..5 {
+                engine.record_observation(
+                    &format!("CALL{i}"),
+                    14_025_000,
+                    &format!("SKIM{j}"),
+                    now,
+                );
+            }
+        }
+        assert_eq!(engine.total_observations, 50);
+
+        // Reduce max to 20 — should evict until at or below 20
+        let mut new_config = SkimmerQualityConfig::default();
+        new_config.max_tracked_observations = 20;
+        engine.update_config(new_config);
+
+        assert!(engine.total_observations <= 20);
     }
 
     #[test]
