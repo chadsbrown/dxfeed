@@ -1,3 +1,4 @@
+pub mod aggregator;
 pub mod callsign;
 pub mod domain;
 pub mod filter;
