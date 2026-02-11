@@ -131,8 +131,7 @@ hot-reloaded). Example JSON:
 }
 ```
 
-See `FilterConfigSerde` rustdoc for the full set of filter sections: `rf`,
-`dx`, `spotter`, `content`, `correlation`, `skimmer`, `geo`, `enrichment`.
+For the complete configuration reference, see [`doc/CONFIGURATION.md`](doc/CONFIGURATION.md).
 
 ### Aggregator
 
