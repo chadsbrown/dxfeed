@@ -17,6 +17,7 @@ use crate::filter::compiled::FilterConfig;
 use crate::filter::config::FilterConfigSerde;
 use crate::filter::error::FilterConfigError;
 use crate::model::DxEvent;
+use crate::resolver::entity::EntityResolver;
 use crate::skimmer::config::SkimmerQualityConfig;
 use crate::source::SourceMessage;
 use crate::source::supervisor::{run_supervised_source, BackoffConfig, SourceConfig};
@@ -47,6 +48,7 @@ pub struct DxFeedBuilder {
     filter: FilterConfigSerde,
     aggregator_config: AggregatorConfig,
     skimmer_quality: Option<SkimmerQualityConfig>,
+    entity_resolver: Option<Box<dyn EntityResolver>>,
     backoff: BackoffConfig,
     source_channel_capacity: usize,
     event_channel_capacity: usize,
@@ -66,6 +68,7 @@ impl DxFeedBuilder {
             filter: FilterConfigSerde::default(),
             aggregator_config: AggregatorConfig::default(),
             skimmer_quality: None,
+            entity_resolver: None,
             backoff: BackoffConfig::default(),
             source_channel_capacity: 256,
             event_channel_capacity: 256,
@@ -94,6 +97,12 @@ impl DxFeedBuilder {
     /// Enable skimmer quality gating with the given configuration.
     pub fn set_skimmer_quality(mut self, config: SkimmerQualityConfig) -> Self {
         self.skimmer_quality = Some(config);
+        self
+    }
+
+    /// Set an entity (DXCC) resolver for geographic data.
+    pub fn entity_resolver(mut self, resolver: Box<dyn EntityResolver>) -> Self {
+        self.entity_resolver = Some(resolver);
         self
     }
 
@@ -165,6 +174,7 @@ impl DxFeedBuilder {
             filter_rx,
             self.aggregator_config,
             self.skimmer_quality,
+            self.entity_resolver,
             agg_shutdown,
             self.tick_interval,
         ));
@@ -230,17 +240,19 @@ impl DxFeed {
 // Aggregator task
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_aggregator_task(
     mut source_rx: mpsc::Receiver<SourceMessage>,
     event_tx: mpsc::Sender<DxEvent>,
     mut filter_rx: watch::Receiver<FilterConfig>,
     config: AggregatorConfig,
     skimmer_config: Option<SkimmerQualityConfig>,
+    entity_resolver: Option<Box<dyn EntityResolver>>,
     shutdown: CancellationToken,
     tick_interval: Duration,
 ) {
     let initial_filter = filter_rx.borrow_and_update().clone();
-    let mut aggregator = Aggregator::new(initial_filter, skimmer_config, config);
+    let mut aggregator = Aggregator::new(initial_filter, skimmer_config, config, entity_resolver);
     let mut tick = tokio::time::interval(tick_interval);
 
     loop {

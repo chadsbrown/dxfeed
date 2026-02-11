@@ -16,9 +16,10 @@
 - [x] Step 13: RBN source connector (278 tests cumulative)
 - [x] Step 14: Source supervision with backoff (283 tests cumulative)
 - [x] Step 15: DxFeedBuilder + top-level API + multi-source orchestration (290 tests cumulative)
+- [x] Step 16: Entity resolver trait + cty.dat parser (315 tests with cty feature)
 
 ## Current Step
-Step 16: Entity resolver trait + optional cty.dat parser
+Step 17: Enrichment resolver traits
 
 ## Applied Fixes (from review)
 - [x] Fix #1: Added CQ/ITU zone checks to eval_entity() and eval_geo() (Step 5)

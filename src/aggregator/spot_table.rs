@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{Band, DxMode, OriginatorKind};
 use crate::model::{DxSpot, SpotConfidence, SpotKey, SpotObservation};
+use crate::resolver::entity::EntityInfo;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -51,6 +52,10 @@ pub struct SpotState {
     pub human_originator_set: HashSet<String>,
     /// Set of unique source IDs.
     pub source_set: HashSet<String>,
+    /// Resolved entity info for the DX callsign (set by aggregator).
+    pub dx_entity: Option<EntityInfo>,
+    /// Resolved entity info for the most recent spotter (set by aggregator).
+    pub spotter_entity: Option<EntityInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +186,8 @@ impl SpotTable {
                 originator_set,
                 human_originator_set,
                 source_set,
+                dx_entity: None,
+                spotter_entity: None,
             };
 
             let key = input.key.clone();

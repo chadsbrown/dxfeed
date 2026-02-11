@@ -6,5 +6,6 @@ pub mod filter;
 pub mod freq;
 pub mod model;
 pub mod parser;
+pub mod resolver;
 pub mod skimmer;
 pub mod source;

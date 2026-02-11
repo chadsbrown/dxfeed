@@ -10,6 +10,7 @@ license = "MIT"
 default = ["serde"]
 serde = ["dep:serde"]
 raw-lines = []
+cty = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }

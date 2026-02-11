@@ -17,6 +17,7 @@ use crate::model::{
     SpotConfidence, SpotEventKind, SpotKey, SpotObservation, SpotView,
 };
 use crate::parser::spot::{ParsedSpot, RbnFields};
+use crate::resolver::entity::EntityResolver;
 use crate::skimmer::config::SkimmerQualityConfig;
 use crate::skimmer::quality::SkimmerQualityEngine;
 
@@ -100,6 +101,7 @@ pub struct Aggregator {
     spot_table: SpotTable,
     filter: FilterConfig,
     skimmer_engine: Option<SkimmerQualityEngine>,
+    entity_resolver: Option<Box<dyn EntityResolver>>,
     config: AggregatorConfig,
 }
 
@@ -108,6 +110,7 @@ impl Aggregator {
         filter: FilterConfig,
         skimmer_config: Option<SkimmerQualityConfig>,
         config: AggregatorConfig,
+        entity_resolver: Option<Box<dyn EntityResolver>>,
     ) -> Self {
         let spot_table = SpotTable::new(SpotTableConfig {
             ttl: config.spot_ttl,
@@ -120,6 +123,7 @@ impl Aggregator {
             spot_table,
             filter,
             skimmer_engine,
+            entity_resolver,
             config,
         }
     }
@@ -183,7 +187,17 @@ impl Aggregator {
 
         let table_result = self.spot_table.ingest(input);
 
-        // 5. Compute skimmer quality tag (if enabled and skimmer)
+        // 5. Resolve entity info (if resolver is available)
+        if let Some(resolver) = &self.entity_resolver {
+            if let Some(state) = self.spot_table.get_mut(&key) {
+                if state.dx_entity.is_none() {
+                    state.dx_entity = resolver.resolve(&dx_call_norm);
+                }
+                state.spotter_entity = resolver.resolve(&spotter_call_norm);
+            }
+        }
+
+        // 6. Compute skimmer quality tag (if enabled and skimmer)
         let skim_tag = if let Some(engine) = &mut self.skimmer_engine {
             if obs.originator_kind == OriginatorKind::Skimmer {
                 engine.record_observation(&dx_call_norm, freq_hz, &spotter_call_norm, now);
@@ -307,8 +321,30 @@ impl Aggregator {
             wpm: rbn.wpm,
             is_skimmer_dupe: false,
             is_skimmer_cq: rbn.is_cq,
-            dx_geo: GeoResolved::default(),
-            spotter_geo: GeoResolved::default(),
+            dx_geo: match &state.dx_entity {
+                Some(info) => GeoResolved {
+                    continent: Some(info.continent),
+                    cq_zone: Some(info.cq_zone),
+                    itu_zone: Some(info.itu_zone),
+                    entity: Some(&info.entity_name),
+                    country: None,
+                    state: None,
+                    grid: None,
+                },
+                None => GeoResolved::default(),
+            },
+            spotter_geo: match &state.spotter_entity {
+                Some(info) => GeoResolved {
+                    continent: Some(info.continent),
+                    cq_zone: Some(info.cq_zone),
+                    itu_zone: Some(info.itu_zone),
+                    entity: Some(&info.entity_name),
+                    country: None,
+                    state: None,
+                    grid: None,
+                },
+                None => GeoResolved::default(),
+            },
             lotw: None,
             in_master_db: None,
             in_callbook: None,
@@ -427,7 +463,7 @@ mod tests {
     }
 
     fn default_aggregator() -> Aggregator {
-        Aggregator::new(default_filter(), None, AggregatorConfig::default())
+        Aggregator::new(default_filter(), None, AggregatorConfig::default(), None)
     }
 
     // -----------------------------------------------------------------------
@@ -471,7 +507,7 @@ mod tests {
         let mut config = AggregatorConfig::default();
         config.dedupe.emit_updates = true;
 
-        let mut agg = Aggregator::new(default_filter(), None, config);
+        let mut agg = Aggregator::new(default_filter(), None, config, None);
 
         let obs1 = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
         let obs2 = make_obs("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human);
@@ -497,7 +533,7 @@ mod tests {
         filter_cfg.rf.band_deny.insert(Band::B20);
         let filter = filter_cfg.validate_and_compile().unwrap();
 
-        let mut agg = Aggregator::new(filter, None, AggregatorConfig::default());
+        let mut agg = Aggregator::new(filter, None, AggregatorConfig::default(), None);
 
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
         let event = agg.process_observation(obs);
@@ -516,6 +552,7 @@ mod tests {
             default_filter(),
             Some(skim_cfg),
             AggregatorConfig::default(),
+            None,
         );
 
         // Single skimmer report → SkimUnknown → blocked
@@ -532,6 +569,7 @@ mod tests {
             default_filter(),
             Some(skim_cfg),
             AggregatorConfig::default(),
+            None,
         );
 
         let now = Utc::now();
@@ -562,6 +600,7 @@ mod tests {
             default_filter(),
             Some(skim_cfg),
             AggregatorConfig::default(),
+            None,
         );
 
         let obs = make_obs("JA1ABC", "W1AW", 14_025_000, "cluster1", OriginatorKind::Human);
@@ -577,7 +616,7 @@ mod tests {
     fn tick_evicts_expired_spots() {
         let mut config = AggregatorConfig::default();
         config.spot_ttl = Duration::from_secs(60);
-        let mut agg = Aggregator::new(default_filter(), None, config);
+        let mut agg = Aggregator::new(default_filter(), None, config, None);
 
         let now = Utc::now();
         let old = now - chrono::Duration::seconds(120);
@@ -638,7 +677,7 @@ mod tests {
     fn revision_increments_across_observations() {
         let mut config = AggregatorConfig::default();
         config.dedupe.emit_updates = true;
-        let mut agg = Aggregator::new(default_filter(), None, config);
+        let mut agg = Aggregator::new(default_filter(), None, config, None);
 
         let obs1 = make_obs("JA1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human);
         let obs2 = make_obs("JA1ABC", "VE3NEA", 14_025_005, "src1", OriginatorKind::Human);
