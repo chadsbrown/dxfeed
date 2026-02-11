@@ -269,6 +269,11 @@ impl Aggregator {
         &self.spot_table
     }
 
+    /// Replace the active filter with a new compiled filter config.
+    pub fn update_filter(&mut self, filter: FilterConfig) {
+        self.filter = filter;
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------

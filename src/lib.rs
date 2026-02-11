@@ -1,6 +1,7 @@
 pub mod aggregator;
 pub mod callsign;
 pub mod domain;
+pub mod feed;
 pub mod filter;
 pub mod freq;
 pub mod model;

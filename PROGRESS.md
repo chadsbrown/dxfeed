@@ -15,9 +15,10 @@
 - [x] Step 12: Telnet source connector (275 tests cumulative)
 - [x] Step 13: RBN source connector (278 tests cumulative)
 - [x] Step 14: Source supervision with backoff (283 tests cumulative)
+- [x] Step 15: DxFeedBuilder + top-level API + multi-source orchestration (290 tests cumulative)
 
 ## Current Step
-Step 15: DxFeedBuilder + top-level API + multi-source orchestration
+Step 16: Entity resolver trait + optional cty.dat parser
 
 ## Applied Fixes (from review)
 - [x] Fix #1: Added CQ/ITU zone checks to eval_entity() and eval_geo() (Step 5)
