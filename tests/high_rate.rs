@@ -6,7 +6,7 @@ use std::time::Duration;
 use dxfeed::feed::DxFeedBuilder;
 use dxfeed::model::{DxEvent, SourceId, SpotEventKind};
 use dxfeed::source::supervisor::{BackoffConfig, SourceConfig};
-use dxfeed::source::telnet::TelnetSourceConfig;
+use dxfeed::source::cluster::ClusterSourceConfig;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -68,7 +68,7 @@ async fn high_rate_no_panic() {
         stream.shutdown().await.ok();
     });
 
-    let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr.ip().to_string(),
         addr.port(),
         "TEST",
@@ -153,13 +153,13 @@ async fn high_rate_multi_source() {
         stream.shutdown().await.ok();
     });
 
-    let config1 = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config1 = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr1.ip().to_string(),
         addr1.port(),
         "TEST",
         SourceId("stress1".into()),
     ));
-    let config2 = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config2 = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr2.ip().to_string(),
         addr2.port(),
         "TEST",

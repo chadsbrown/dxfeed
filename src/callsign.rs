@@ -87,8 +87,7 @@ pub fn base_callsign(call: &str) -> &str {
 /// Heuristic check for whether a callsign looks like an automated skimmer.
 ///
 /// RBN skimmers typically have a `-N` suffix (e.g., `W3LPL-2`, `DK8JP-1`).
-/// This is best-effort; the definitive originator kind is set by the source
-/// connector based on whether the spot came from RBN.
+/// Used by `OriginatorPolicy::Auto` to classify spots per-spotter.
 pub fn is_likely_skimmer(call: &str) -> bool {
     if let Some(pos) = call.rfind('-') {
         let after = &call[pos + 1..];

@@ -8,8 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{SourceConnectionState, SourceId, SourceStatus};
 
-use super::rbn::{run_rbn_source, RbnSourceConfig};
-use super::telnet::{run_telnet_source, TelnetSourceConfig};
+use super::cluster::{run_cluster_source, ClusterSourceConfig};
 use super::{SourceError, SourceMessage};
 
 // ---------------------------------------------------------------------------
@@ -19,15 +18,13 @@ use super::{SourceError, SourceMessage};
 /// Which type of source to run.
 #[derive(Debug, Clone)]
 pub enum SourceConfig {
-    Telnet(TelnetSourceConfig),
-    Rbn(RbnSourceConfig),
+    Cluster(ClusterSourceConfig),
 }
 
 impl SourceConfig {
     fn source_id(&self) -> &SourceId {
         match self {
-            Self::Telnet(c) => &c.source_id,
-            Self::Rbn(c) => &c.source_id,
+            Self::Cluster(c) => &c.source_id,
         }
     }
 }
@@ -230,8 +227,7 @@ async fn run_source(
     shutdown: CancellationToken,
 ) -> Result<(), SourceError> {
     match config {
-        SourceConfig::Telnet(c) => run_telnet_source(c.clone(), tx, shutdown).await,
-        SourceConfig::Rbn(c) => run_rbn_source(c.clone(), tx, shutdown).await,
+        SourceConfig::Cluster(c) => run_cluster_source(c.clone(), tx, shutdown).await,
     }
 }
 
@@ -324,7 +320,7 @@ mod tests {
             s2.shutdown().await.ok();
         });
 
-        let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr.ip().to_string(),
             addr.port(),
             "W1AW",
@@ -386,7 +382,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
 
-        let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr.ip().to_string(),
             addr.port(),
             "W1AW",

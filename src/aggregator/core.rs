@@ -16,7 +16,7 @@ use crate::model::{
     DxEvent, DxSpot, DxSpotEvent, GeoResolved, OriginatorId, SkimQualityTag, SourceId,
     SpotConfidence, SpotEventKind, SpotKey, SpotObservation, SpotView,
 };
-use crate::parser::spot::{ParsedSpot, RbnFields};
+use crate::parser::spot::{ParsedSpot, SkimmerFields};
 use crate::resolver::enrichment::EnrichmentResolver;
 use crate::resolver::entity::EntityResolver;
 use crate::skimmer::config::SkimmerQualityConfig;
@@ -90,7 +90,7 @@ pub struct IncomingObservation {
     pub source_id: SourceId,
     pub originator_kind: OriginatorKind,
     pub received_at: DateTime<Utc>,
-    pub rbn_fields: Option<RbnFields>,
+    pub skimmer_fields: Option<SkimmerFields>,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,16 +168,16 @@ impl Aggregator {
             freq_bucket_hz: bucket,
         };
 
-        // Extract RBN fields
-        let rbn = obs.rbn_fields.unwrap_or_default();
+        // Extract skimmer fields
+        let skim = obs.skimmer_fields.unwrap_or_default();
 
         // 4. Build observation and ingest into spot table
         let observation = SpotObservation {
             source: obs.source_id.clone(),
             originator: OriginatorId(spotter_call_norm.clone()),
             originator_kind: obs.originator_kind,
-            snr_db: rbn.snr_db,
-            wpm: rbn.wpm,
+            snr_db: skim.snr_db,
+            wpm: skim.wpm,
             obs_time: now,
             #[cfg(feature = "raw-lines")]
             raw: None,
@@ -246,7 +246,7 @@ impl Aggregator {
 
         // 7. Build SpotView and apply general filter
         let state = self.spot_table.get(&key)?;
-        let view = self.build_spot_view(state, &spotter_call_norm, &obs.source_id.0, obs.originator_kind, &rbn, now);
+        let view = self.build_spot_view(state, &spotter_call_norm, &obs.source_id.0, obs.originator_kind, &skim, now);
 
         if let FilterDecision::Drop(_) = evaluate(&view, &self.filter) {
             return None;
@@ -353,7 +353,7 @@ impl Aggregator {
         spotter_call_norm: &'a str,
         source_id: &'a str,
         originator_kind: OriginatorKind,
-        rbn: &RbnFields,
+        skim: &SkimmerFields,
         now: DateTime<Utc>,
     ) -> SpotView<'a> {
         SpotView {
@@ -372,10 +372,10 @@ impl Aggregator {
             spotter_call_norm: Some(spotter_call_norm),
             spotter_source_id: Some(source_id),
             originator_kind,
-            snr_db: rbn.snr_db,
-            wpm: rbn.wpm,
+            snr_db: skim.snr_db,
+            wpm: skim.wpm,
             is_skimmer_dupe: false,
-            is_skimmer_cq: rbn.is_cq,
+            is_skimmer_cq: skim.is_cq,
             dx_geo: match &state.dx_entity {
                 Some(info) => GeoResolved {
                     continent: Some(info.continent),
@@ -490,7 +490,7 @@ mod tests {
             source_id: SourceId(source.into()),
             originator_kind: kind,
             received_at: Utc::now(),
-            rbn_fields: None,
+            skimmer_fields: None,
         }
     }
 
@@ -513,7 +513,7 @@ mod tests {
             source_id: SourceId(source.into()),
             originator_kind: kind,
             received_at: time,
-            rbn_fields: None,
+            skimmer_fields: None,
         }
     }
 

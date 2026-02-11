@@ -5,11 +5,11 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
-A Rust library that connects to multiple DX cluster and Reverse Beacon Network
-(RBN) telnet sources, aggregates spots with deduplication and frequency
-bucketing, applies configurable filters, classifies skimmer quality
-(CT1BOH/AR-Cluster style), resolves DXCC entities, and emits a unified stream
-of `DxEvent`s. All configuration is hot-reloadable at runtime. Built on tokio.
+A Rust library that connects to one or more DX cluster nodes, aggregates
+spots with deduplication and frequency bucketing, applies configurable
+filters, classifies skimmer quality (CT1BOH/AR-Cluster style), resolves
+DXCC entities, and emits a unified stream of `DxEvent`s. All configuration
+is hot-reloadable at runtime. Built on tokio.
 
 ## Quick Start
 
@@ -17,12 +17,12 @@ of `DxEvent`s. All configuration is hot-reloadable at runtime. Built on tokio.
 use std::time::Duration;
 use dxfeed::feed::DxFeedBuilder;
 use dxfeed::model::{DxEvent, SourceId, SpotEventKind};
+use dxfeed::source::cluster::ClusterSourceConfig;
 use dxfeed::source::supervisor::SourceConfig;
-use dxfeed::source::telnet::TelnetSourceConfig;
 
 #[tokio::main]
 async fn main() {
-    let source = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let source = SourceConfig::Cluster(ClusterSourceConfig::new(
         "dx.example.com",
         7300,
         "W1AW",
@@ -59,6 +59,33 @@ async fn main() {
 }
 ```
 
+### Connecting to RBN
+
+Use the `ClusterSourceConfig::rbn()` convenience constructor, which pre-sets
+the RBN host/port and `OriginatorPolicy::AllSkimmer`:
+
+```rust,no_run
+use dxfeed::model::SourceId;
+use dxfeed::source::cluster::ClusterSourceConfig;
+use dxfeed::source::supervisor::SourceConfig;
+
+let rbn = SourceConfig::Cluster(ClusterSourceConfig::rbn(
+    "W1AW",
+    SourceId("rbn".into()),
+));
+```
+
+### Originator Policy
+
+`ClusterSourceConfig` includes an `originator_policy` field that controls
+how spots are classified:
+
+| Policy | Description |
+|--------|-------------|
+| `Auto` (default) | Infer per-spot from spotter callsign pattern (e.g., `-N` suffix = skimmer) |
+| `AllSkimmer` | Force all spots from this connection to `OriginatorKind::Skimmer` |
+| `AllHuman` | Force all spots from this connection to `OriginatorKind::Human` |
+
 ## Features
 
 | Feature    | Default | Description |
@@ -71,7 +98,7 @@ async fn main() {
 ## Architecture
 
 ```
-Sources (telnet/RBN)
+Cluster Sources
     |
     v
 Aggregator
@@ -91,11 +118,11 @@ DxEvent stream  -->  your application
 | `aggregator` | `Aggregator`, `SpotTable`, `AggregatorConfig` — core pipeline |
 | `filter` | `FilterConfigSerde` — declarative filter rules (band, mode, callsign, geo, correlation, etc.) |
 | `skimmer` | `SkimmerQualityEngine`, `SkimmerQualityConfig` — skimmer gating |
-| `source` | Telnet and RBN connectors with supervised reconnect |
+| `source` | Cluster source connector with supervised reconnect |
 | `resolver` | `EntityResolver` / `EnrichmentResolver` traits, `CtyResolver` |
 | `model` | `DxEvent`, `DxSpot`, `SpotObservation`, `SpotKey` |
 | `domain` | `Band`, `DxMode`, `Continent`, `OriginatorKind`, etc. |
-| `parser` | DX spot line parser, RBN comment field parser |
+| `parser` | DX spot line parser, skimmer comment field parser |
 | `freq` | Frequency-to-band/mode mapping, bucket computation |
 | `callsign` | Normalization, portable suffix stripping, skimmer detection |
 
@@ -252,9 +279,9 @@ list, skimmer quality tag, confidence level) plus a monotonically increasing
 A test harness binary is available behind the `cli` feature:
 
 ```sh
-cargo run --features cli -- --callsign W1AW telnet dx.example.com 7300
-cargo run --features cli -- --callsign W1AW rbn
-cargo run --features cli -- --callsign W1AW --json --emit-updates rbn
+cargo run --features cli -- --callsign W1AW connect dx.example.com 7300
+cargo run --features cli -- --callsign W1AW connect telnet.reversebeacon.net 7000 --originator-policy all-skimmer
+cargo run --features cli -- --callsign W1AW --json --emit-updates connect dx.example.com 7300
 cargo run --features cli -- --dump-default-filter > filter.json
 ```
 

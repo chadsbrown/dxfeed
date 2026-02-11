@@ -5,8 +5,8 @@ use std::time::Duration;
 use dxfeed::domain::{Band, DxMode};
 use dxfeed::feed::{DxFeedBuilder, DxFeed};
 use dxfeed::model::{DxEvent, SourceId, SpotEventKind};
+use dxfeed::source::cluster::ClusterSourceConfig;
 use dxfeed::source::supervisor::{BackoffConfig, SourceConfig};
-use dxfeed::source::telnet::TelnetSourceConfig;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -77,7 +77,7 @@ async fn basic_pipeline_dxspider_fixture() {
 
     let server = tokio::spawn(serve_lines(listener, lines));
 
-    let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr.ip().to_string(),
         addr.port(),
         "TEST",
@@ -130,13 +130,13 @@ async fn multi_source_dedup() {
     let server1 = tokio::spawn(serve_lines(listener1, vec![line.to_string()]));
     let server2 = tokio::spawn(serve_lines(listener2, vec![line.to_string()]));
 
-    let config1 = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config1 = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr1.ip().to_string(),
         addr1.port(),
         "TEST",
         SourceId("src1".into()),
     ));
-    let config2 = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config2 = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr2.ip().to_string(),
         addr2.port(),
         "TEST",
@@ -177,7 +177,6 @@ async fn multi_source_dedup() {
 #[tokio::test]
 async fn skimmer_gating_end_to_end() {
     use dxfeed::skimmer::config::SkimmerQualityConfig;
-    use dxfeed::source::rbn::RbnSourceConfig;
 
     // Three different skimmers report the same call
     let lines = vec![
@@ -189,12 +188,12 @@ async fn skimmer_gating_end_to_end() {
     let (listener, addr) = bind_listener().await;
     let server = tokio::spawn(serve_lines(listener, lines));
 
-    let mut rbn_config = RbnSourceConfig::new("TEST", SourceId("rbn-test".into()));
+    let mut rbn_config = ClusterSourceConfig::rbn("TEST", SourceId("rbn-test".into()));
     rbn_config.host = addr.ip().to_string();
     rbn_config.port = addr.port();
 
     let mut feed = DxFeedBuilder::new()
-        .add_source(SourceConfig::Rbn(rbn_config))
+        .add_source(SourceConfig::Cluster(rbn_config))
         .set_skimmer_quality(SkimmerQualityConfig::default())
         .set_backoff(fast_backoff())
         .tick_interval(Duration::from_secs(60))
@@ -240,7 +239,7 @@ async fn filter_blocks_denied_band() {
     let mut filter = FilterConfigSerde::default();
     filter.rf.band_deny.insert(Band::B20);
 
-    let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr.ip().to_string(),
         addr.port(),
         "TEST",
@@ -284,7 +283,7 @@ async fn filter_allows_only_listed_modes() {
     let mut filter = FilterConfigSerde::default();
     filter.rf.mode_allow.insert(DxMode::CW);
 
-    let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr.ip().to_string(),
         addr.port(),
         "TEST",
@@ -345,7 +344,7 @@ async fn hot_filter_update_takes_effect() {
         stream.shutdown().await.ok();
     });
 
-    let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr.ip().to_string(),
         addr.port(),
         "TEST",
@@ -418,20 +417,18 @@ async fn hot_filter_update_takes_effect() {
 
 #[tokio::test]
 async fn rbn_fixture_produces_spots() {
-    use dxfeed::source::rbn::RbnSourceConfig;
-
     let fixture = include_str!("fixtures/rbn_spots.txt");
     let lines: Vec<String> = fixture.lines().map(|l| l.to_string()).collect();
 
     let (listener, addr) = bind_listener().await;
     let server = tokio::spawn(serve_lines(listener, lines));
 
-    let mut rbn_config = RbnSourceConfig::new("TEST", SourceId("rbn-test".into()));
+    let mut rbn_config = ClusterSourceConfig::rbn("TEST", SourceId("rbn-test".into()));
     rbn_config.host = addr.ip().to_string();
     rbn_config.port = addr.port();
 
     let mut feed = DxFeedBuilder::new()
-        .add_source(SourceConfig::Rbn(rbn_config))
+        .add_source(SourceConfig::Cluster(rbn_config))
         .set_backoff(fast_backoff())
         .tick_interval(Duration::from_secs(60))
         .build()
@@ -496,7 +493,7 @@ async fn reconnect_after_server_drop() {
         }
     });
 
-    let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr.ip().to_string(),
         addr.port(),
         "TEST",
@@ -538,7 +535,7 @@ async fn arcluster_fixture_produces_spots() {
     let (listener, addr) = bind_listener().await;
     let server = tokio::spawn(serve_lines(listener, lines));
 
-    let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+    let config = SourceConfig::Cluster(ClusterSourceConfig::new(
         addr.ip().to_string(),
         addr.port(),
         "TEST",

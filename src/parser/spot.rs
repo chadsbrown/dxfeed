@@ -24,7 +24,7 @@ pub struct ParsedSpot {
     pub dx_call: String,
     /// Frequency in Hz, parsed directly from the string to avoid f64 rounding.
     pub freq_hz: u64,
-    /// Comment/info field (may contain SNR/WPM for RBN spots).
+    /// Comment/info field (may contain SNR/WPM for skimmer spots).
     pub comment: Option<String>,
     /// UTC time parsed from the line (HHMMz), if present.
     pub utc_time: Option<NaiveTime>,
@@ -45,9 +45,9 @@ pub enum ParsedLine {
     Unknown(String),
 }
 
-/// RBN-specific parsed fields from a spot comment.
+/// Skimmer-specific parsed fields from a spot comment.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct RbnFields {
+pub struct SkimmerFields {
     pub snr_db: Option<i8>,
     pub wpm: Option<u16>,
     pub is_cq: bool,
@@ -296,11 +296,11 @@ fn parse_hhmm(s: &str) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(hour, min, 0)
 }
 
-/// Parse RBN-specific fields from a spot comment.
+/// Parse skimmer-specific fields from a spot comment.
 ///
-/// RBN comments typically look like: "15 dB  22 WPM  CQ"
-pub fn parse_rbn_comment(comment: &str) -> RbnFields {
-    let mut fields = RbnFields::default();
+/// Skimmer comments typically look like: "15 dB  22 WPM  CQ"
+pub fn parse_skimmer_comment(comment: &str) -> SkimmerFields {
+    let mut fields = SkimmerFields::default();
 
     // Look for "NN dB" pattern
     let parts: Vec<&str> = comment.split_whitespace().collect();
@@ -454,7 +454,7 @@ mod tests {
                 assert_eq!(s.spotter_call, "W3OA-2");
                 assert_eq!(s.dx_call, "JA1ABC");
                 let comment = s.comment.as_deref().unwrap();
-                let rbn = parse_rbn_comment(comment);
+                let rbn = parse_skimmer_comment(comment);
                 assert_eq!(rbn.snr_db, Some(15));
                 assert_eq!(rbn.wpm, Some(22));
                 assert!(rbn.is_cq);
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn rbn_comment_full() {
-        let fields = parse_rbn_comment("15 dB  22 WPM  CQ");
+        let fields = parse_skimmer_comment("15 dB  22 WPM  CQ");
         assert_eq!(fields.snr_db, Some(15));
         assert_eq!(fields.wpm, Some(22));
         assert!(fields.is_cq);
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn rbn_comment_beacon() {
-        let fields = parse_rbn_comment("8 dB  18 WPM  BEACON");
+        let fields = parse_skimmer_comment("8 dB  18 WPM  BEACON");
         assert_eq!(fields.snr_db, Some(8));
         assert_eq!(fields.wpm, Some(18));
         assert!(!fields.is_cq);
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn rbn_comment_no_cq() {
-        let fields = parse_rbn_comment("20 dB  25 WPM  NCDXF");
+        let fields = parse_skimmer_comment("20 dB  25 WPM  NCDXF");
         assert_eq!(fields.snr_db, Some(20));
         assert_eq!(fields.wpm, Some(25));
         assert!(!fields.is_cq);
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn rbn_comment_malformed() {
-        let fields = parse_rbn_comment("random text");
+        let fields = parse_skimmer_comment("random text");
         assert_eq!(fields.snr_db, None);
         assert_eq!(fields.wpm, None);
         assert!(!fields.is_cq);
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn rbn_comment_empty() {
-        let fields = parse_rbn_comment("");
-        assert_eq!(fields, RbnFields::default());
+        let fields = parse_skimmer_comment("");
+        assert_eq!(fields, SkimmerFields::default());
     }
 
     // -----------------------------------------------------------------------

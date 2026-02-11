@@ -83,7 +83,7 @@ fn bench_aggregator_ingest(c: &mut Criterion) {
                 source_id: SourceId("bench".into()),
                 originator_kind: OriginatorKind::Human,
                 received_at: Utc::now(),
-                rbn_fields: None,
+                skimmer_fields: None,
             };
             let _ = black_box(agg.process_observation(obs));
             i += 1;

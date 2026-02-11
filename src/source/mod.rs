@@ -1,9 +1,8 @@
-//! Source connectors: telnet cluster and RBN ingest.
+//! Source connectors for DX cluster nodes.
 
+pub mod cluster;
 pub mod iac;
-pub mod rbn;
 pub mod supervisor;
-pub mod telnet;
 
 use crate::aggregator::core::IncomingObservation;
 use crate::model::{DxAnnounce, SourceStatus};

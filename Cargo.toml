@@ -11,9 +11,12 @@ default = ["serde"]
 serde = ["dep:serde"]
 raw-lines = []
 cty = []
+cli = ["cty", "serde", "dep:clap", "dep:serde_json", "tokio/signal"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 globset = "0.4"
@@ -25,6 +28,10 @@ tokio-util = "0.7"
 serde_json = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
+
+[[bin]]
+name = "dxfeed-cli"
+required-features = ["cli"]
 
 [[bench]]
 name = "pipeline"

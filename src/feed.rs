@@ -79,7 +79,7 @@ impl DxFeedBuilder {
         }
     }
 
-    /// Add a source (telnet cluster or RBN) to the feed.
+    /// Add a cluster source to the feed.
     pub fn add_source(mut self, source: SourceConfig) -> Self {
         self.sources.push(source);
         self
@@ -420,7 +420,7 @@ mod tests {
     use crate::filter::config::FilterConfigSerde;
     use crate::model::{DxEvent, SourceId, SpotEventKind};
     use crate::source::supervisor::{BackoffConfig, SourceConfig};
-    use crate::source::telnet::TelnetSourceConfig;
+    use crate::source::cluster::ClusterSourceConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -447,7 +447,7 @@ mod tests {
         filter.freq_sanity_hz = Some((100_000_000, 1_000)); // reversed range
 
         let result = DxFeedBuilder::new()
-            .add_source(SourceConfig::Telnet(TelnetSourceConfig::new(
+            .add_source(SourceConfig::Cluster(ClusterSourceConfig::new(
                 "127.0.0.1",
                 7300,
                 "W1AW",
@@ -489,7 +489,7 @@ mod tests {
             stream.shutdown().await.ok();
         });
 
-        let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr.ip().to_string(),
             addr.port(),
             "W1AW",
@@ -545,7 +545,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
 
-        let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr.ip().to_string(),
             addr.port(),
             "W1AW",
@@ -620,7 +620,7 @@ mod tests {
             stream.shutdown().await.ok();
         });
 
-        let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr.ip().to_string(),
             addr.port(),
             "W1AW",
@@ -722,7 +722,7 @@ mod tests {
             stream.shutdown().await.ok();
         });
 
-        let config = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr.ip().to_string(),
             addr.port(),
             "W1AW",
@@ -827,13 +827,13 @@ mod tests {
             stream.shutdown().await.ok();
         });
 
-        let config1 = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config1 = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr1.ip().to_string(),
             addr1.port(),
             "W1AW",
             SourceId("src1".into()),
         ));
-        let config2 = SourceConfig::Telnet(TelnetSourceConfig::new(
+        let config2 = SourceConfig::Cluster(ClusterSourceConfig::new(
             addr2.ip().to_string(),
             addr2.port(),
             "W1AW",
