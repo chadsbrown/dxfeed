@@ -1,0 +1,145 @@
+{
+  "max_age_secs": 900,
+  "freq_sanity_hz": [
+    1800000,
+    54000000
+  ],
+  "unknown_policy": "Neutral",
+  "rf": {
+    "band_allow": [],
+    "band_deny": [],
+    "mode_allow": ["CW"],
+    "mode_deny": [],
+    "freq_allow_hz": [],
+    "freq_deny_hz": [],
+    "profiles": [],
+    "mode_policy": "PreferUpstreamFallbackInfer"
+  },
+  "dx": {
+    "allow": {
+      "globs": [],
+      "regexes": [],
+      "case_insensitive": false
+    },
+    "deny": {
+      "globs": [],
+      "regexes": [],
+      "case_insensitive": false
+    },
+    "normalization": {
+      "uppercase": true,
+      "portable_policy": "KeepAsIs",
+      "strip_non_alnum": false
+    }
+  },
+  "spotter": {
+    "callsign": {
+      "allow": {
+        "globs": [],
+        "regexes": [],
+        "case_insensitive": false
+      },
+      "deny": {
+        "globs": [],
+        "regexes": [],
+        "case_insensitive": false
+      },
+      "normalization": {
+        "uppercase": true,
+        "portable_policy": "KeepAsIs",
+        "strip_non_alnum": false
+      }
+    },
+    "source_allow": [],
+    "source_deny": [],
+    "allow_human": true,
+    "allow_skimmer": true,
+    "allow_unknown_kind": true
+  },
+  "content": {
+    "comment_allow": {
+      "globs": [],
+      "regexes": [],
+      "case_insensitive": false
+    },
+    "comment_deny": {
+      "globs": [],
+      "regexes": [],
+      "case_insensitive": false
+    },
+    "cq_only": false,
+    "suppress_split_qsy": false,
+    "require_comment_when_allowlist_present": true
+  },
+  "correlation": {
+    "min_unique_originators": 2,
+    "originators_human_only": false,
+    "min_unique_sources": 1,
+    "min_observations": 3,
+    "window_secs": 180,
+    "min_repeats_same_key": 1
+  },
+  "skimmer": {
+    "snr_db": null,
+    "wpm": null,
+    "drop_dupes": false,
+    "require_cq": false
+  },
+  "geo": {
+    "dx": {
+      "continent_allow": [],
+      "continent_deny": [],
+      "cq_zone_allow": [],
+      "cq_zone_deny": [],
+      "itu_zone_allow": [],
+      "itu_zone_deny": [],
+      "entity_allow": [],
+      "entity_deny": [],
+      "country_allow": [],
+      "country_deny": [],
+      "state_allow": [],
+      "state_deny": [],
+      "grid_allow": {
+        "globs": [],
+        "regexes": [],
+        "case_insensitive": false
+      },
+      "grid_deny": {
+        "globs": [],
+        "regexes": [],
+        "case_insensitive": false
+      }
+    },
+    "spotter": {
+      "continent_allow": [],
+      "continent_deny": [],
+      "cq_zone_allow": [],
+      "cq_zone_deny": [],
+      "itu_zone_allow": [],
+      "itu_zone_deny": [],
+      "entity_allow": [],
+      "entity_deny": [],
+      "country_allow": [],
+      "country_deny": [],
+      "state_allow": [],
+      "state_deny": [],
+      "grid_allow": {
+        "globs": [],
+        "regexes": [],
+        "case_insensitive": false
+      },
+      "grid_deny": {
+        "globs": [],
+        "regexes": [],
+        "case_insensitive": false
+      }
+    },
+    "require_resolvers": false
+  },
+  "enrichment": {
+    "lotw": "Any",
+    "in_master_db": "Any",
+    "in_callbook": "Any",
+    "membership": []
+  }
+}
