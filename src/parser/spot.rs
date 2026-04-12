@@ -15,6 +15,8 @@
 
 use chrono::NaiveTime;
 
+use crate::domain::DxMode;
+
 /// A parsed DX spot with all fields extracted from a single line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedSpot {
@@ -51,6 +53,9 @@ pub struct SkimmerFields {
     pub snr_db: Option<i8>,
     pub wpm: Option<u16>,
     pub is_cq: bool,
+    /// Mode declared by the skimmer (first token of the comment for RBN).
+    /// `None` when no recognizable mode token is present.
+    pub mode: Option<DxMode>,
 }
 
 /// Parse a single line from a DX cluster or RBN telnet connection.
@@ -298,12 +303,18 @@ fn parse_hhmm(s: &str) -> Option<NaiveTime> {
 
 /// Parse skimmer-specific fields from a spot comment.
 ///
-/// Skimmer comments typically look like: "15 dB  22 WPM  CQ"
+/// RBN-style skimmer comments look like `"CW 15 dB  22 WPM  CQ"` or
+/// `"FT8 -12 dB  1500 Hz"`. The first token is the declared mode.
 pub fn parse_skimmer_comment(comment: &str) -> SkimmerFields {
     let mut fields = SkimmerFields::default();
 
-    // Look for "NN dB" pattern
     let parts: Vec<&str> = comment.split_whitespace().collect();
+
+    if let Some(first) = parts.first() {
+        fields.mode = parse_mode_token(first);
+    }
+
+    // Look for "NN dB" pattern
     for i in 0..parts.len().saturating_sub(1) {
         if parts[i + 1].eq_ignore_ascii_case("dB") {
             if let Ok(snr) = parts[i].parse::<i8>() {
@@ -323,6 +334,41 @@ pub fn parse_skimmer_comment(comment: &str) -> SkimmerFields {
         .any(|p| p.eq_ignore_ascii_case("CQ"));
 
     fields
+}
+
+/// Map an RBN-style mode token to a DxMode.
+///
+/// Unknown tokens return `None` so the caller can fall back to frequency
+/// inference. Any digital mode name maps to `DxMode::DIG`.
+fn parse_mode_token(tok: &str) -> Option<DxMode> {
+    // Uppercase without allocating for the common-case short token.
+    let mut buf = [0u8; 16];
+    let bytes = tok.as_bytes();
+    if bytes.len() > buf.len() {
+        return None;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        buf[i] = b.to_ascii_uppercase();
+    }
+    let upper = &buf[..bytes.len()];
+
+    match upper {
+        b"CW" => Some(DxMode::CW),
+        b"SSB" | b"LSB" | b"USB" => Some(DxMode::SSB),
+        b"AM" => Some(DxMode::AM),
+        b"FM" => Some(DxMode::FM),
+        b"RTTY" | b"FT8" | b"FT4" | b"JT65" | b"JT9" | b"MFSK" | b"OLIVIA"
+        | b"DOMINO" | b"MSK144" | b"FST4" | b"FST4W" | b"Q65" | b"THROB"
+        | b"HELL" | b"ROS" | b"CONTESTI" | b"JS8" | b"WSPR" => Some(DxMode::DIG),
+        _ => {
+            // PSK variants (PSK31, PSK63, PSK125, PSK, etc.)
+            if upper.starts_with(b"PSK") {
+                Some(DxMode::DIG)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -448,13 +494,14 @@ mod tests {
 
     #[test]
     fn parse_rbn_format_line() {
-        let line = "DX de W3OA-2:    14025.0  JA1ABC       15 dB  22 WPM  CQ              0230Z";
+        let line = "DX de W3OA-2:    14025.0  JA1ABC       CW  15 dB  22 WPM  CQ              0230Z";
         match parse_line(line) {
             ParsedLine::Spot(s) => {
                 assert_eq!(s.spotter_call, "W3OA-2");
                 assert_eq!(s.dx_call, "JA1ABC");
                 let comment = s.comment.as_deref().unwrap();
                 let rbn = parse_skimmer_comment(comment);
+                assert_eq!(rbn.mode, Some(DxMode::CW));
                 assert_eq!(rbn.snr_db, Some(15));
                 assert_eq!(rbn.wpm, Some(22));
                 assert!(rbn.is_cq);
@@ -575,7 +622,18 @@ mod tests {
 
     #[test]
     fn rbn_comment_full() {
+        let fields = parse_skimmer_comment("CW 15 dB  22 WPM  CQ");
+        assert_eq!(fields.mode, Some(DxMode::CW));
+        assert_eq!(fields.snr_db, Some(15));
+        assert_eq!(fields.wpm, Some(22));
+        assert!(fields.is_cq);
+    }
+
+    #[test]
+    fn rbn_comment_without_mode_token() {
+        // Older/legacy comment format with no leading mode token.
         let fields = parse_skimmer_comment("15 dB  22 WPM  CQ");
+        assert_eq!(fields.mode, None);
         assert_eq!(fields.snr_db, Some(15));
         assert_eq!(fields.wpm, Some(22));
         assert!(fields.is_cq);
@@ -583,7 +641,8 @@ mod tests {
 
     #[test]
     fn rbn_comment_beacon() {
-        let fields = parse_skimmer_comment("8 dB  18 WPM  BEACON");
+        let fields = parse_skimmer_comment("CW 8 dB  18 WPM  BEACON");
+        assert_eq!(fields.mode, Some(DxMode::CW));
         assert_eq!(fields.snr_db, Some(8));
         assert_eq!(fields.wpm, Some(18));
         assert!(!fields.is_cq);
@@ -591,15 +650,56 @@ mod tests {
 
     #[test]
     fn rbn_comment_no_cq() {
-        let fields = parse_skimmer_comment("20 dB  25 WPM  NCDXF");
+        let fields = parse_skimmer_comment("CW 20 dB  25 WPM  NCDXF");
+        assert_eq!(fields.mode, Some(DxMode::CW));
         assert_eq!(fields.snr_db, Some(20));
         assert_eq!(fields.wpm, Some(25));
         assert!(!fields.is_cq);
     }
 
     #[test]
+    fn rbn_comment_ft8() {
+        let fields = parse_skimmer_comment("FT8 -12 dB  1500 Hz  CQ");
+        assert_eq!(fields.mode, Some(DxMode::DIG));
+        assert_eq!(fields.snr_db, Some(-12));
+        assert!(fields.is_cq);
+    }
+
+    #[test]
+    fn rbn_comment_ft4() {
+        let fields = parse_skimmer_comment("FT4 -8 dB  1500 Hz");
+        assert_eq!(fields.mode, Some(DxMode::DIG));
+    }
+
+    #[test]
+    fn rbn_comment_rtty() {
+        let fields = parse_skimmer_comment("RTTY 10 dB  45 BPS  CQ");
+        assert_eq!(fields.mode, Some(DxMode::DIG));
+    }
+
+    #[test]
+    fn rbn_comment_psk31() {
+        let fields = parse_skimmer_comment("PSK31 5 dB  31 BPS");
+        assert_eq!(fields.mode, Some(DxMode::DIG));
+    }
+
+    #[test]
+    fn rbn_comment_ssb_variants() {
+        assert_eq!(parse_skimmer_comment("SSB 10 dB").mode, Some(DxMode::SSB));
+        assert_eq!(parse_skimmer_comment("USB 10 dB").mode, Some(DxMode::SSB));
+        assert_eq!(parse_skimmer_comment("LSB 10 dB").mode, Some(DxMode::SSB));
+    }
+
+    #[test]
+    fn rbn_comment_mode_case_insensitive() {
+        assert_eq!(parse_skimmer_comment("cw 10 dB").mode, Some(DxMode::CW));
+        assert_eq!(parse_skimmer_comment("Ft8 10 dB").mode, Some(DxMode::DIG));
+    }
+
+    #[test]
     fn rbn_comment_malformed() {
         let fields = parse_skimmer_comment("random text");
+        assert_eq!(fields.mode, None);
         assert_eq!(fields.snr_db, None);
         assert_eq!(fields.wpm, None);
         assert!(!fields.is_cq);

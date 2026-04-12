@@ -171,7 +171,15 @@ impl Aggregator {
         // 2. Compute band, mode, freq bucket
         let freq_hz = obs.parsed.freq_hz;
         let band = freq_to_band(freq_hz);
-        let mode = resolve_mode(freq_hz, None, self.config.mode_policy);
+        // Only skimmer spots carry an authoritative mode in the comment; for
+        // human spots the cluster protocol has no mode field, so pass None and
+        // let resolve_mode fall back to frequency inference.
+        let upstream_mode = if obs.originator_kind == OriginatorKind::Skimmer {
+            obs.skimmer_fields.as_ref().and_then(|s| s.mode)
+        } else {
+            None
+        };
+        let mode = resolve_mode(freq_hz, upstream_mode, self.config.mode_policy);
         let bucket = freq_bucket(
             freq_hz,
             mode,
@@ -1085,8 +1093,10 @@ mod tests {
         let e4 = agg.process_observation(obs4);
         assert!(e4.is_empty(), "unverified spot should not trigger QSY");
 
-        // Original spot still in table
-        assert_eq!(agg.spot_table().len(), 2); // both freq buckets ingested
+        // Original spot still in table. 40m at 7.043 is now CW (10 Hz bucket),
+        // so each of the four distinct skimmer frequencies lands in its own
+        // SpotKey — gating only affects emission, not ingestion.
+        assert_eq!(agg.spot_table().len(), 4);
     }
 
     #[test]

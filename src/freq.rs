@@ -42,62 +42,60 @@ pub fn band_edges(band: Band) -> Option<(u64, u64)> {
     }
 }
 
-/// Best-effort mode inference from frequency using IARU band plans.
+/// Best-effort mode inference from frequency.
 ///
-/// This is a rough approximation. Contest operators should use the
-/// `ModePolicy` system to control how mode is determined.
+/// Only a fallback for when the spot source does not supply a mode (human
+/// cluster spots). Boundaries are deliberately wider than strict IARU band
+/// plans because CW routinely appears above the nominal CW sub-band —
+/// especially during contests — and skimmer spots at those frequencies would
+/// otherwise be mislabeled as DIG/SSB and filtered out.
 pub fn freq_to_mode(freq_hz: u64) -> DxMode {
     match freq_hz {
         // 160m
-        1_800_000..=1_843_000 => DxMode::CW,
-        1_843_001..=2_000_000 => DxMode::SSB,
+        1_800_000..=1_840_000 => DxMode::CW,
+        1_840_001..=2_000_000 => DxMode::SSB,
 
         // 80m
-        3_500_000..=3_570_000 => DxMode::CW,
-        3_570_001..=3_600_000 => DxMode::DIG,
+        3_500_000..=3_600_000 => DxMode::CW,
         3_600_001..=4_000_000 => DxMode::SSB,
 
         // 60m (mixed usage, mostly digital/SSB)
         5_250_000..=5_450_000 => DxMode::DIG,
 
         // 40m
-        7_000_000..=7_040_000 => DxMode::CW,
-        7_040_001..=7_060_000 => DxMode::DIG,
-        7_060_001..=7_300_000 => DxMode::SSB,
+        7_000_000..=7_125_000 => DxMode::CW,
+        7_125_001..=7_300_000 => DxMode::SSB,
 
         // 30m (CW and digital only, no SSB)
-        10_100_000..=10_130_000 => DxMode::CW,
-        10_130_001..=10_150_000 => DxMode::DIG,
+        10_100_000..=10_140_000 => DxMode::CW,
+        10_140_001..=10_150_000 => DxMode::DIG,
 
         // 20m
-        14_000_000..=14_070_000 => DxMode::CW,
-        14_070_001..=14_099_000 => DxMode::DIG,
-        14_099_001..=14_350_000 => DxMode::SSB,
+        14_000_000..=14_100_000 => DxMode::CW,
+        14_100_001..=14_112_000 => DxMode::DIG,
+        14_112_001..=14_350_000 => DxMode::SSB,
 
         // 17m
-        18_068_000..=18_095_000 => DxMode::CW,
-        18_095_001..=18_109_000 => DxMode::DIG,
-        18_109_001..=18_168_000 => DxMode::SSB,
+        18_068_000..=18_110_000 => DxMode::CW,
+        18_110_001..=18_168_000 => DxMode::SSB,
 
         // 15m
-        21_000_000..=21_070_000 => DxMode::CW,
-        21_070_001..=21_110_000 => DxMode::DIG,
-        21_110_001..=21_450_000 => DxMode::SSB,
+        21_000_000..=21_200_000 => DxMode::CW,
+        21_200_001..=21_450_000 => DxMode::SSB,
 
         // 12m
-        24_890_000..=24_915_000 => DxMode::CW,
-        24_915_001..=24_931_000 => DxMode::DIG,
-        24_931_001..=24_990_000 => DxMode::SSB,
+        24_890_000..=24_930_000 => DxMode::CW,
+        24_930_001..=24_990_000 => DxMode::SSB,
 
         // 10m
-        28_000_000..=28_070_000 => DxMode::CW,
-        28_070_001..=28_190_000 => DxMode::DIG,
-        28_190_001..=29_700_000 => DxMode::SSB,
+        28_000_000..=28_300_000 => DxMode::CW,
+        28_300_001..=29_700_000 => DxMode::SSB,
 
         // 6m
         50_000_000..=50_100_000 => DxMode::CW,
-        50_100_001..=50_500_000 => DxMode::SSB,
-        50_500_001..=54_000_000 => DxMode::DIG,
+        50_100_001..=50_300_000 => DxMode::SSB,
+        50_300_001..=50_400_000 => DxMode::DIG,
+        50_400_001..=54_000_000 => DxMode::SSB,
 
         // 2m
         144_000_000..=144_150_000 => DxMode::CW,
@@ -211,22 +209,38 @@ mod tests {
     #[test]
     fn freq_to_mode_cw() {
         assert_eq!(freq_to_mode(14_025_000), DxMode::CW);
-        assert_eq!(freq_to_mode(7_010_000), DxMode::CW);
         assert_eq!(freq_to_mode(21_025_000), DxMode::CW);
+        // Expanded boundaries: frequencies that used to be DIG/SSB now CW
+        assert_eq!(freq_to_mode(7_050_000), DxMode::CW);
+        assert_eq!(freq_to_mode(7_100_000), DxMode::CW);
+        assert_eq!(freq_to_mode(14_074_000), DxMode::CW);
+        assert_eq!(freq_to_mode(21_150_000), DxMode::CW);
+        assert_eq!(freq_to_mode(28_200_000), DxMode::CW);
     }
 
     #[test]
     fn freq_to_mode_ssb() {
         assert_eq!(freq_to_mode(14_200_000), DxMode::SSB);
-        assert_eq!(freq_to_mode(7_100_000), DxMode::SSB);
+        assert_eq!(freq_to_mode(7_200_000), DxMode::SSB);
         assert_eq!(freq_to_mode(3_750_000), DxMode::SSB);
+        assert_eq!(freq_to_mode(21_300_000), DxMode::SSB);
     }
 
     #[test]
     fn freq_to_mode_dig() {
-        assert_eq!(freq_to_mode(14_074_000), DxMode::DIG);
-        assert_eq!(freq_to_mode(7_050_000), DxMode::DIG);
-        assert_eq!(freq_to_mode(10_140_000), DxMode::DIG);
+        assert_eq!(freq_to_mode(10_145_000), DxMode::DIG);
+        assert_eq!(freq_to_mode(14_105_000), DxMode::DIG);
+        assert_eq!(freq_to_mode(50_350_000), DxMode::DIG);
+    }
+
+    #[test]
+    fn freq_to_mode_40m_cliff() {
+        // Regression: 7.045 and 7.100 used to be DIG/SSB and got dropped
+        // by a CW-only filter. They must now be CW.
+        assert_eq!(freq_to_mode(7_045_000), DxMode::CW);
+        assert_eq!(freq_to_mode(7_099_000), DxMode::CW);
+        assert_eq!(freq_to_mode(7_125_000), DxMode::CW);
+        assert_eq!(freq_to_mode(7_125_001), DxMode::SSB);
     }
 
     #[test]
