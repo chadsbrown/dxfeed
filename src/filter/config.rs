@@ -16,6 +16,7 @@ use crate::domain::{
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct FilterConfigSerde {
     /// Maximum age in seconds; spots older than this at ingestion time are dropped.
     pub max_age_secs: u64,
@@ -58,6 +59,7 @@ impl Default for FilterConfigSerde {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct RfFiltersSerde {
     pub band_allow: BTreeSet<Band>,
     pub band_deny: BTreeSet<Band>,
@@ -103,6 +105,7 @@ pub struct RfProfileSerde {
 
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct CallsignFiltersSerde {
     pub allow: PatternSetSerde,
     pub deny: PatternSetSerde,
@@ -111,6 +114,7 @@ pub struct CallsignFiltersSerde {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct CallsignNormalizationSerde {
     pub uppercase: bool,
     pub portable_policy: PortablePolicy,
@@ -133,6 +137,7 @@ impl Default for CallsignNormalizationSerde {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct SpotterFiltersSerde {
     pub callsign: CallsignFiltersSerde,
     pub source_allow: BTreeSet<String>,
@@ -161,6 +166,7 @@ impl Default for SpotterFiltersSerde {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct ContentFiltersSerde {
     pub comment_allow: PatternSetSerde,
     pub comment_deny: PatternSetSerde,
@@ -187,6 +193,7 @@ impl Default for ContentFiltersSerde {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct CorrelationFiltersSerde {
     pub min_unique_originators: u8,
     pub originators_human_only: bool,
@@ -215,6 +222,7 @@ impl Default for CorrelationFiltersSerde {
 
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct SkimmerMetricFiltersSerde {
     /// Optional SNR range (min_db, max_db).
     pub snr_db: Option<(i8, i8)>,
@@ -230,6 +238,7 @@ pub struct SkimmerMetricFiltersSerde {
 
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct GeoFiltersSerde {
     pub dx: EntityFiltersSerde,
     pub spotter: EntityFiltersSerde,
@@ -238,6 +247,7 @@ pub struct GeoFiltersSerde {
 
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct EntityFiltersSerde {
     pub continent_allow: BTreeSet<Continent>,
     pub continent_deny: BTreeSet<Continent>,
@@ -265,6 +275,7 @@ pub struct EntityFiltersSerde {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct EnrichmentFiltersSerde {
     pub lotw: TriState,
     pub in_master_db: TriState,
@@ -298,6 +309,7 @@ pub enum MembershipRuleSerde {
 /// A set of glob and/or regex patterns for matching callsigns, comments, etc.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct PatternSetSerde {
     #[cfg_attr(feature = "serde", serde(default))]
     pub globs: Vec<String>,
@@ -420,6 +432,35 @@ mod tests {
             let back: FilterConfigSerde = serde_json::from_str(&json).unwrap();
             assert_eq!(back.enrichment.lotw, TriState::RequireTrue);
             assert_eq!(back.enrichment.membership.len(), 2);
+        }
+
+        #[test]
+        fn minimal_json_fills_defaults() {
+            let json = r#"{
+                "skimmer": { "snr_db": [10, 80], "wpm": [25, 50] },
+                "enrichment": { "in_master_db": "RequireTrue" }
+            }"#;
+            let cfg: FilterConfigSerde = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.skimmer.snr_db, Some((10, 80)));
+            assert_eq!(cfg.skimmer.wpm, Some((25, 50)));
+            assert!(!cfg.skimmer.drop_dupes);
+            assert!(!cfg.skimmer.require_cq);
+            assert_eq!(cfg.enrichment.in_master_db, TriState::RequireTrue);
+            assert_eq!(cfg.enrichment.lotw, TriState::Any);
+            // All other sections should be at defaults.
+            assert_eq!(cfg.max_age_secs, 15 * 60);
+            assert!(cfg.rf.band_allow.is_empty());
+            assert!(cfg.spotter.allow_human);
+            assert_eq!(cfg.correlation.min_unique_originators, 1);
+        }
+
+        #[test]
+        fn empty_json_parses_to_defaults() {
+            let cfg: FilterConfigSerde = serde_json::from_str("{}").unwrap();
+            let baseline = FilterConfigSerde::default();
+            assert_eq!(cfg.max_age_secs, baseline.max_age_secs);
+            assert_eq!(cfg.enrichment.lotw, baseline.enrichment.lotw);
+            assert!(cfg.skimmer.snr_db.is_none());
         }
 
         #[test]
