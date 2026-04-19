@@ -86,11 +86,17 @@ pub fn base_callsign(call: &str) -> &str {
 
 /// Heuristic check for whether a callsign looks like an automated skimmer.
 ///
-/// RBN skimmers typically have a `-N` suffix (e.g., `W3LPL-2`, `DK8JP-1`).
+/// Recognizes two conventions:
+/// - RBN-style `-N` / `-NN` digit suffix (e.g., `W3LPL-2`, `DK8JP-1`).
+/// - AR-Cluster `-#` marker (e.g., `W8WTS-#`, `AC0C-1-#`).
+///
 /// Used by `OriginatorPolicy::Auto` to classify spots per-spotter.
 pub fn is_likely_skimmer(call: &str) -> bool {
     if let Some(pos) = call.rfind('-') {
         let after = &call[pos + 1..];
+        if after == "#" {
+            return true;
+        }
         !after.is_empty() && after.len() <= 2 && after.chars().all(|c| c.is_ascii_digit())
     } else {
         false
@@ -341,5 +347,13 @@ mod tests {
     #[test]
     fn not_skimmer_trailing_dash() {
         assert!(!is_likely_skimmer("W3LPL-"));
+    }
+
+    #[test]
+    fn skimmer_arc_hash_suffix() {
+        assert!(is_likely_skimmer("W8WTS-#"));
+        assert!(is_likely_skimmer("W3LPL-#"));
+        assert!(is_likely_skimmer("KM3T-5-#"));
+        assert!(is_likely_skimmer("AC0C-1-#"));
     }
 }
