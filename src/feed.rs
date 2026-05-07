@@ -316,6 +316,17 @@ impl DxFeed {
             .send_modify(|c| c.dedupe.detect_qsy = detect);
     }
 
+    /// Set the QSY hysteresis window.
+    ///
+    /// When `Some(window)`, a QSY firing within `window` of the old spot's
+    /// last emission has its Withdraw suppressed (only the New is emitted),
+    /// suppressing the DROP/SPOT churn from cluster-protocol freq
+    /// quantization and skimmer jitter. `None` always emits the pair.
+    pub fn set_qsy_coalesce_window(&self, window: Option<Duration>) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.dedupe.qsy_coalesce_window = window);
+    }
+
     // -- Convenience setters (skimmer) --
 
     /// Toggle skimmer quality gating on or off.

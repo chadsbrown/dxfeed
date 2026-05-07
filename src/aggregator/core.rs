@@ -39,7 +39,11 @@ pub struct FreqBucketConfig {
 impl Default for FreqBucketConfig {
     fn default() -> Self {
         Self {
-            cw_bucket_hz: 10,
+            // 200 Hz absorbs the cluster protocol's 100 Hz quantization
+            // (DXC reports kHz with one decimal) and the bulk of skimmer
+            // freq jitter, which together drive most observed false-QSY
+            // churn at a 10 Hz bucket.
+            cw_bucket_hz: 200,
             ssb_bucket_hz: 1000,
             dig_bucket_hz: 100,
         }
@@ -60,6 +64,17 @@ pub struct DedupeConfig {
     /// spot on this band/mode at a different frequency bucket, withdraw the
     /// old spot before emitting the new one.
     pub detect_qsy: bool,
+    /// QSY hysteresis window. When `Some(window)` and a QSY would fire
+    /// within `window` of the old spot's last emission, suppress the
+    /// `Withdraw` event and emit only the new `New`. The aggregator still
+    /// removes the old `SpotKey` from the table; consumers see a single
+    /// new emission rather than a `Withdraw`/`New` pair. `None` disables
+    /// the hysteresis (always emit the pair on QSY).
+    ///
+    /// Defaults to `Some(200ms)`, which is well below typical real-QSY
+    /// timescales (seconds) and well above observed cluster-quantization /
+    /// skimmer-jitter cycle gaps (sub-millisecond to ~50 ms).
+    pub qsy_coalesce_window: Option<Duration>,
 }
 
 impl Default for DedupeConfig {
@@ -68,6 +83,7 @@ impl Default for DedupeConfig {
             emit_updates: false,
             min_update_interval: None,
             detect_qsy: true,
+            qsy_coalesce_window: Some(Duration::from_millis(200)),
         }
     }
 }
@@ -290,13 +306,41 @@ impl Aggregator {
         // 9. QSY detection: if a New spot was emitted and we already have an
         //    emitted spot for this (call, band, mode) at a *different* freq
         //    bucket, withdraw the old spot first.
+        //
+        //    QSY hysteresis: when `qsy_coalesce_window` is set and the old
+        //    spot was emitted within the window, the Withdraw is suppressed
+        //    and only the New is forwarded. This collapses the DROP/SPOT
+        //    churn that comes from cluster-protocol freq quantization (DXC
+        //    reports kHz with 1 decimal) and skimmer-freq jitter hashing
+        //    the same signal into adjacent buckets, while preserving the
+        //    pair semantics for genuine QSYs (which arrive seconds apart).
         if self.config.dedupe.detect_qsy {
             if let Some(DxEvent::Spot(ref e)) = base_event {
                 if e.kind == SpotEventKind::New {
                     let cbm = CallBandModeKey::from(&key);
                     if let Some(old_key) = self.spot_table.lookup_emitted(&cbm).cloned() {
                         if old_key != key {
-                            // QSY: withdraw old, emit new
+                            let coalesce = self
+                                .config
+                                .dedupe
+                                .qsy_coalesce_window
+                                .and_then(|win| {
+                                    let last_at =
+                                        self.spot_table.get(&old_key)?.last_emitted_at?;
+                                    let elapsed =
+                                        now.signed_duration_since(last_at).to_std().ok()?;
+                                    Some(elapsed < win)
+                                })
+                                .unwrap_or(false);
+
+                            if coalesce {
+                                // Suppress Withdraw, emit only New.
+                                self.spot_table.remove_spot(&old_key);
+                                self.spot_table.register_emission(&key);
+                                return base_event.into_iter().collect();
+                            }
+
+                            // Standard QSY: withdraw old, emit new
                             let mut events = Vec::with_capacity(2);
                             if let Some((old_spot, old_rev)) = self.spot_table.remove_spot(&old_key) {
                                 events.push(DxEvent::Spot(DxSpotEvent {
@@ -992,14 +1036,20 @@ mod tests {
     fn qsy_within_band_emits_withdraw_then_new() {
         let mut agg = default_aggregator();
 
+        let t0 = Utc::now();
+        // Outside the default 200 ms hysteresis window so the standard
+        // QSY [Withdraw, New] pair is emitted.
+        let t_qsy = t0 + chrono::Duration::seconds(5);
+
         // First spot: N9UNX on 7.043 MHz (40m CW)
-        let obs1 = make_obs("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human);
+        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
         let e1 = agg.process_observation(obs1);
         assert_eq!(e1.len(), 1);
         assert!(matches!(&e1[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
 
         // QSY: same call, same band/mode, different freq bucket (7.044 MHz)
-        let obs2 = make_obs("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human);
+        let obs2 =
+            make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t_qsy);
         let e2 = agg.process_observation(obs2);
         assert_eq!(e2.len(), 2, "should emit [Withdraw, New]");
 
@@ -1093,30 +1143,36 @@ mod tests {
         let e4 = agg.process_observation(obs4);
         assert!(e4.is_empty(), "unverified spot should not trigger QSY");
 
-        // Original spot still in table. 40m at 7.043 is now CW (10 Hz bucket),
-        // so each of the four distinct skimmer frequencies lands in its own
-        // SpotKey — gating only affects emission, not ingestion.
-        assert_eq!(agg.spot_table().len(), 4);
+        // Original spot still in table. With the 200 Hz CW bucket, the three
+        // 7.043 MHz skimmer frequencies (7_043_000, 7_043_050, 7_043_080)
+        // collapse into one SpotKey and 7_044_000 lands in another — two
+        // keys total. Gating only affects emission, not ingestion.
+        assert_eq!(agg.spot_table().len(), 2);
     }
 
     #[test]
     fn qsy_rapid_back_and_forth() {
         let mut agg = default_aggregator();
 
-        // A on freq A
-        let obs1 = make_obs("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human);
+        // Space the moves outside the default 200 ms hysteresis window so
+        // each transition emits the full [Withdraw, New] pair. The
+        // hysteresis-on case is covered in
+        // qsy_within_hysteresis_window_suppresses_withdraw.
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(5);
+        let t2 = t0 + chrono::Duration::seconds(10);
+
+        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
         let e1 = agg.process_observation(obs1);
         assert_eq!(e1.len(), 1);
 
-        // A → freq B (QSY)
-        let obs2 = make_obs("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human);
+        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t1);
         let e2 = agg.process_observation(obs2);
         assert_eq!(e2.len(), 2);
         assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
         assert!(matches!(&e2[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
 
-        // B → freq A (QSY back)
-        let obs3 = make_obs("N9UNX", "DL1ABC", 7_043_000, "src1", OriginatorKind::Human);
+        let obs3 = make_obs_at("N9UNX", "DL1ABC", 7_043_000, "src1", OriginatorKind::Human, t2);
         let e3 = agg.process_observation(obs3);
         assert_eq!(e3.len(), 2);
         assert!(matches!(&e3[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
@@ -1124,6 +1180,78 @@ mod tests {
 
         // Only one spot should exist in the table
         assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // QSY hysteresis (qsy_coalesce_window)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qsy_within_hysteresis_window_suppresses_withdraw() {
+        // Default qsy_coalesce_window is Some(200ms).
+        let mut agg = default_aggregator();
+
+        let t0 = Utc::now();
+        // 50 ms later — well inside the 200 ms window. Mirrors the
+        // sub-second cluster-quantization / skimmer-jitter cycle observed
+        // in real captures.
+        let t1 = t0 + chrono::Duration::milliseconds(50);
+
+        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
+        let e1 = agg.process_observation(obs1);
+        assert_eq!(e1.len(), 1);
+        assert!(matches!(&e1[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+
+        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t1);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 1, "Withdraw should be suppressed inside the window");
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+        if let DxEvent::Spot(n) = &e2[0] {
+            assert_eq!(n.spot.freq_hz, 7_044_000);
+        }
+
+        // Old key removed, new key tracked — single entry remains.
+        assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    #[test]
+    fn qsy_outside_hysteresis_window_emits_pair() {
+        // 250 ms > 200 ms default window → standard QSY pair.
+        let mut agg = default_aggregator();
+
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::milliseconds(250);
+
+        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
+        agg.process_observation(obs1);
+
+        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t1);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 2);
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
+        assert!(matches!(&e2[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+    }
+
+    #[test]
+    fn qsy_hysteresis_disabled_always_emits_pair() {
+        // qsy_coalesce_window = None → always emit the pair, even at zero
+        // gap (preserves the pre-hysteresis behavior for consumers that
+        // need the Withdraw signal).
+        let mut config = AggregatorConfig::default();
+        config.dedupe.qsy_coalesce_window = None;
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::milliseconds(1);
+
+        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
+        agg.process_observation(obs1);
+
+        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t1);
+        let e2 = agg.process_observation(obs2);
+        assert_eq!(e2.len(), 2);
+        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
+        assert!(matches!(&e2[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
     }
 
     #[test]
