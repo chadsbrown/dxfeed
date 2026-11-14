@@ -13,8 +13,8 @@ use crate::filter::decision::FilterDecision;
 use crate::filter::evaluate::evaluate;
 use crate::freq::{freq_bucket, freq_to_band, resolve_mode};
 use crate::model::{
-    DxEvent, DxSpotEvent, GeoResolved, OriginatorId, SkimQualityTag, SourceId, SpotEventKind,
-    SpotKey, SpotObservation, SpotView,
+    DxEvent, DxSpot, DxSpotEvent, GeoResolved, OriginatorId, SkimQualityTag, SourceId,
+    SpotEventKind, SpotKey, SpotObservation, SpotView, WithdrawReason,
 };
 use crate::parser::spot::{ParsedSpot, SkimmerFields};
 use crate::resolver::enrichment::EnrichmentResolver;
@@ -22,7 +22,9 @@ use crate::resolver::entity::EntityResolver;
 use crate::skimmer::config::SkimmerQualityConfig;
 use crate::skimmer::quality::SkimmerQualityEngine;
 
-use super::spot_table::{CallBandModeKey, IngestInput, SpotTable, SpotTableConfig, SpotTableResult};
+use super::spot_table::{
+    CallBandModeKey, IngestInput, RemovedSpot, SpotTable, SpotTableConfig, SpotTableResult,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -105,19 +107,10 @@ pub struct DedupeConfig {
     pub min_update_interval: Option<Duration>,
     /// When true (default), detect QSY: if a station already has an emitted
     /// spot on this band/mode at a different frequency bucket, withdraw the
-    /// old spot before emitting the new one.
+    /// old spot before emitting the new one. Every such move emits the
+    /// `[Withdraw, New]` pair; "different bucket" only arises when the new
+    /// frequency is outside `match_tolerance` of the old spot.
     pub detect_qsy: bool,
-    /// QSY hysteresis window. When `Some(window)` and a QSY would fire
-    /// within `window` of the old spot's last emission, suppress the
-    /// `Withdraw` event and emit only the new `New`. The aggregator still
-    /// removes the old `SpotKey` from the table; consumers see a single
-    /// new emission rather than a `Withdraw`/`New` pair. `None` disables
-    /// the hysteresis (always emit the pair on QSY).
-    ///
-    /// Defaults to `Some(200ms)`, which is well below typical real-QSY
-    /// timescales (seconds) and well above observed cluster-quantization /
-    /// skimmer-jitter cycle gaps (sub-millisecond to ~50 ms).
-    pub qsy_coalesce_window: Option<Duration>,
 }
 
 impl Default for DedupeConfig {
@@ -126,7 +119,6 @@ impl Default for DedupeConfig {
             emit_updates: false,
             min_update_interval: None,
             detect_qsy: true,
-            qsy_coalesce_window: Some(Duration::from_millis(200)),
         }
     }
 }
@@ -223,9 +215,24 @@ impl Aggregator {
     /// Process an incoming observation through the full pipeline.
     ///
     /// Returns a `Vec<DxEvent>` — usually 0 or 1 events, but may return
-    /// `[Withdraw, New]` when QSY is detected (station changed frequency
-    /// bucket within the same band/mode).
+    /// `[Withdraw, New]` when QSY is detected (station moved outside the
+    /// match tolerance within the same band/mode), preceded by a `Withdraw`
+    /// for any emitted spot evicted to keep the table within `max_spots`.
     pub fn process_observation(&mut self, obs: IncomingObservation) -> Vec<DxEvent> {
+        let events = self.process_observation_inner(obs);
+
+        // Cap eviction happens during ingest, before anything this
+        // observation emits, and must be reported even when the observation
+        // itself is gated or filtered.
+        let mut out = self.drain_cap_evicted();
+        if out.is_empty() {
+            return events;
+        }
+        out.extend(events);
+        out
+    }
+
+    fn process_observation_inner(&mut self, obs: IncomingObservation) -> Vec<DxEvent> {
         let now = obs.received_at;
 
         // 1. Normalize callsigns
@@ -365,57 +372,27 @@ impl Aggregator {
         // -- mutable borrow from decide_emission is released here --
 
         // 9. QSY detection: if a New spot was emitted and we already have an
-        //    emitted spot for this (call, band, mode) at a *different* freq
-        //    bucket, withdraw the old spot first.
-        //
-        //    QSY hysteresis: when `qsy_coalesce_window` is set and the old
-        //    spot was emitted within the window, the Withdraw is suppressed
-        //    and only the New is forwarded. This collapses the DROP/SPOT
-        //    churn that comes from cluster-protocol freq quantization (DXC
-        //    reports kHz with 1 decimal) and skimmer-freq jitter hashing
-        //    the same signal into adjacent buckets, while preserving the
-        //    pair semantics for genuine QSYs (which arrive seconds apart).
+        //    emitted spot for this (call, band, mode) under a different key,
+        //    the station has moved: withdraw the old spot first. The pair is
+        //    always emitted, so the consumer never holds a spot that the
+        //    table has dropped.
         if self.config.dedupe.detect_qsy {
             if let Some(DxEvent::Spot(ref e)) = base_event {
                 if e.kind == SpotEventKind::New {
                     let cbm = CallBandModeKey::from(&key);
-                    if let Some(old_key) = self.spot_table.lookup_emitted(&cbm).cloned() {
-                        if old_key != key {
-                            let coalesce = self
-                                .config
-                                .dedupe
-                                .qsy_coalesce_window
-                                .and_then(|win| {
-                                    let last_at =
-                                        self.spot_table.get(&old_key)?.last_emitted_at?;
-                                    let elapsed =
-                                        now.signed_duration_since(last_at).to_std().ok()?;
-                                    Some(elapsed < win)
-                                })
-                                .unwrap_or(false);
-
-                            if coalesce {
-                                // Suppress Withdraw, emit only New.
-                                self.spot_table.remove_spot(&old_key);
-                                self.spot_table.register_emission(&key);
-                                return base_event.into_iter().collect();
-                            }
-
-                            // Standard QSY: withdraw old, emit new
-                            let mut events = Vec::with_capacity(2);
-                            if let Some((old_spot, old_rev)) = self.spot_table.remove_spot(&old_key) {
-                                events.push(DxEvent::Spot(DxSpotEvent {
-                                    spot: old_spot,
-                                    kind: SpotEventKind::Withdraw,
-                                    revision: old_rev,
-                                }));
-                            }
-                            self.spot_table.register_emission(&key);
-                            events.push(base_event.unwrap());
-                            return events;
-                        }
-                    }
+                    let old_key = self
+                        .spot_table
+                        .lookup_emitted(&cbm)
+                        .filter(|old| **old != key)
+                        .cloned();
+                    let withdraw = old_key
+                        .and_then(|old| self.spot_table.remove_spot(&old))
+                        .and_then(|removed| withdraw_event(removed, WithdrawReason::Qsy));
                     self.spot_table.register_emission(&key);
+
+                    if let Some(withdraw) = withdraw {
+                        return vec![withdraw, base_event.unwrap()];
+                    }
                 }
             }
         }
@@ -427,15 +404,15 @@ impl Aggregator {
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<DxEvent> {
         let mut events = Vec::new();
 
-        // Evict expired spots and emit Withdraw events with full spot data
+        // Evict expired spots; emit Withdraw (with full spot data) for the
+        // ones the consumer has seen. Spots that were gated or filtered and
+        // never emitted disappear silently.
         let expired = self.spot_table.evict_expired(now);
-        for (spot, revision) in expired {
-            events.push(DxEvent::Spot(DxSpotEvent {
-                spot,
-                kind: SpotEventKind::Withdraw,
-                revision,
-            }));
-        }
+        events.extend(
+            expired
+                .into_iter()
+                .filter_map(|removed| withdraw_event(removed, WithdrawReason::Expired)),
+        );
 
         // Evict expired skimmer observations
         if let Some(engine) = &mut self.skimmer_engine {
@@ -464,7 +441,11 @@ impl Aggregator {
     /// at runtime will cause new observations to hash to different `SpotKey`s
     /// than existing spots. The consumer is responsible for understanding this
     /// effect.
-    pub fn update_aggregator_config(&mut self, config: AggregatorConfig) {
+    ///
+    /// Returns `Withdraw` events for emitted spots evicted because
+    /// `max_spots` was reduced; the caller must forward them.
+    #[must_use = "evicted spots must be withdrawn from the consumer"]
+    pub fn update_aggregator_config(&mut self, config: AggregatorConfig) -> Vec<DxEvent> {
         let table_config = SpotTableConfig {
             ttl: config.spot_ttl,
             max_observations_per_spot: config.max_observations_per_spot,
@@ -472,6 +453,7 @@ impl Aggregator {
         };
         self.spot_table.update_config(table_config);
         self.config = config;
+        self.drain_cap_evicted()
     }
 
     /// Replace or toggle the skimmer quality engine at runtime.
@@ -493,6 +475,15 @@ impl Aggregator {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Withdraw events for emitted spots removed by the `max_spots` cap.
+    fn drain_cap_evicted(&mut self) -> Vec<DxEvent> {
+        self.spot_table
+            .take_cap_evicted()
+            .into_iter()
+            .filter_map(|removed| withdraw_event(removed, WithdrawReason::Evicted))
+            .collect()
+    }
 
     fn build_spot_view<'a>(
         &self,
@@ -570,11 +561,7 @@ impl Aggregator {
                 state.last_emitted_revision = state.revision;
                 state.last_emitted_at = Some(now);
 
-                Some(DxEvent::Spot(DxSpotEvent {
-                    spot: state.spot.clone(),
-                    kind: SpotEventKind::New,
-                    revision: state.revision,
-                }))
+                Some(spot_event(state.spot.clone(), SpotEventKind::New, state.revision))
             }
             SpotTableResult::UpdatedSpot(_) => {
                 if !state.first_emitted {
@@ -583,11 +570,7 @@ impl Aggregator {
                     state.last_emitted_revision = state.revision;
                     state.last_emitted_at = Some(now);
 
-                    return Some(DxEvent::Spot(DxSpotEvent {
-                        spot: state.spot.clone(),
-                        kind: SpotEventKind::New,
-                        revision: state.revision,
-                    }));
+                    return Some(spot_event(state.spot.clone(), SpotEventKind::New, state.revision));
                 }
 
                 if !emit_updates {
@@ -609,11 +592,7 @@ impl Aggregator {
                     state.last_emitted_revision = state.revision;
                     state.last_emitted_at = Some(now);
 
-                    Some(DxEvent::Spot(DxSpotEvent {
-                        spot: state.spot.clone(),
-                        kind: SpotEventKind::Update,
-                        revision: state.revision,
-                    }))
+                    Some(spot_event(state.spot.clone(), SpotEventKind::Update, state.revision))
                 } else {
                     None
                 }
@@ -622,12 +601,35 @@ impl Aggregator {
     }
 }
 
+/// A `New` or `Update` event.
+fn spot_event(spot: DxSpot, kind: SpotEventKind, revision: u32) -> DxEvent {
+    DxEvent::Spot(DxSpotEvent {
+        spot,
+        kind,
+        revision,
+        withdraw_reason: None,
+    })
+}
+
+/// A `Withdraw` event for a removed spot, or `None` if the consumer was
+/// never told about it (and so is owed nothing).
+fn withdraw_event(removed: RemovedSpot, reason: WithdrawReason) -> Option<DxEvent> {
+    removed.was_emitted.then(|| {
+        DxEvent::Spot(DxSpotEvent {
+            spot: removed.spot,
+            kind: SpotEventKind::Withdraw,
+            revision: removed.revision,
+            withdraw_reason: Some(reason),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{Band, DxMode, OriginatorKind};
     use crate::filter::config::FilterConfigSerde;
-    use crate::model::{SourceId, SpotEventKind};
+    use crate::model::{SourceId, SpotEventKind, WithdrawReason};
     use crate::parser::spot::ParsedSpot;
 
     fn default_filter() -> FilterConfig {
@@ -914,7 +916,8 @@ mod tests {
         // Reduce TTL to 60s — the spot is 120s old, so tick should evict it
         let mut config = AggregatorConfig::default();
         config.spot_ttl = Duration::from_secs(60);
-        agg.update_aggregator_config(config);
+        let evicted = agg.update_aggregator_config(config);
+        assert!(evicted.is_empty(), "a TTL change alone evicts nothing");
 
         let events = agg.tick(now);
         assert_eq!(agg.spot_table().len(), 0);
@@ -1098,8 +1101,6 @@ mod tests {
         let mut agg = default_aggregator();
 
         let t0 = Utc::now();
-        // Outside the default 200 ms hysteresis window so the standard
-        // QSY [Withdraw, New] pair is emitted.
         let t_qsy = t0 + chrono::Duration::seconds(5);
 
         // First spot: N9UNX on 7.043 MHz (40m CW)
@@ -1215,10 +1216,7 @@ mod tests {
     fn qsy_rapid_back_and_forth() {
         let mut agg = default_aggregator();
 
-        // Space the moves outside the default 200 ms hysteresis window so
-        // each transition emits the full [Withdraw, New] pair. The
-        // hysteresis-on case is covered in
-        // qsy_within_hysteresis_window_suppresses_withdraw.
+        // Each transition emits the full [Withdraw, New] pair.
         let t0 = Utc::now();
         let t1 = t0 + chrono::Duration::seconds(5);
         let t2 = t0 + chrono::Duration::seconds(10);
@@ -1244,75 +1242,104 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // QSY hysteresis (qsy_coalesce_window)
+    // Lifecycle guarantee: Withdraw only, and always, for emitted spots
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn qsy_within_hysteresis_window_suppresses_withdraw() {
-        // Default qsy_coalesce_window is Some(200ms).
-        let mut agg = default_aggregator();
-
-        let t0 = Utc::now();
-        // 50 ms later — well inside the 200 ms window. Mirrors the
-        // sub-second cluster-quantization / skimmer-jitter cycle observed
-        // in real captures.
-        let t1 = t0 + chrono::Duration::milliseconds(50);
-
-        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
-        let e1 = agg.process_observation(obs1);
-        assert_eq!(e1.len(), 1);
-        assert!(matches!(&e1[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
-
-        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t1);
-        let e2 = agg.process_observation(obs2);
-        assert_eq!(e2.len(), 1, "Withdraw should be suppressed inside the window");
-        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
-        if let DxEvent::Spot(n) = &e2[0] {
-            assert_eq!(n.spot.freq_hz, 7_044_000);
-        }
-
-        // Old key removed, new key tracked — single entry remains.
-        assert_eq!(agg.spot_table().len(), 1);
+    fn withdraw_reasons(events: &[DxEvent]) -> Vec<(String, WithdrawReason)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DxEvent::Spot(s) if s.kind == SpotEventKind::Withdraw => {
+                    Some((s.spot.dx_call.clone(), s.withdraw_reason.unwrap()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn qsy_outside_hysteresis_window_emits_pair() {
-        // 250 ms > 200 ms default window → standard QSY pair.
-        let mut agg = default_aggregator();
-
-        let t0 = Utc::now();
-        let t1 = t0 + chrono::Duration::milliseconds(250);
-
-        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
-        agg.process_observation(obs1);
-
-        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t1);
-        let e2 = agg.process_observation(obs2);
-        assert_eq!(e2.len(), 2);
-        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
-        assert!(matches!(&e2[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
-    }
-
-    #[test]
-    fn qsy_hysteresis_disabled_always_emits_pair() {
-        // qsy_coalesce_window = None → always emit the pair, even at zero
-        // gap (preserves the pre-hysteresis behavior for consumers that
-        // need the Withdraw signal).
+    fn never_emitted_spot_expires_silently() {
         let mut config = AggregatorConfig::default();
-        config.dedupe.qsy_coalesce_window = None;
+        config.spot_ttl = Duration::from_secs(60);
+        let mut agg = Aggregator::new(
+            default_filter(),
+            Some(SkimmerQualityConfig::default()),
+            config,
+            None,
+            None,
+        );
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(120);
+
+        // A single unverified skimmer report: ingested, gated, never emitted.
+        let obs = make_obs_at("JA1ABC", "W3LPL-2", 14_025_000, "rbn", OriginatorKind::Skimmer, old);
+        assert!(agg.process_observation(obs).is_empty());
+        assert_eq!(agg.spot_table().len(), 1);
+
+        let events = agg.tick(now);
+        assert_eq!(agg.spot_table().len(), 0);
+        assert!(events.is_empty(), "no Withdraw for a spot the consumer never saw");
+    }
+
+    #[test]
+    fn expiry_and_qsy_withdraws_carry_reason() {
+        let mut config = AggregatorConfig::default();
+        config.spot_ttl = Duration::from_secs(60);
         let mut agg = Aggregator::new(default_filter(), None, config, None, None);
 
         let t0 = Utc::now();
-        let t1 = t0 + chrono::Duration::milliseconds(1);
+        agg.process_observation(make_obs_at(
+            "N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0,
+        ));
+        let qsy = agg.process_observation(make_obs_at(
+            "N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t0,
+        ));
+        // Even with no time between the two reports, the pair is emitted.
+        assert_eq!(withdraw_reasons(&qsy), vec![("N9UNX".into(), WithdrawReason::Qsy)]);
+        assert!(matches!(&qsy[1], DxEvent::Spot(e)
+            if e.kind == SpotEventKind::New && e.withdraw_reason.is_none()));
 
-        let obs1 = make_obs_at("N9UNX", "W1AW", 7_043_000, "src1", OriginatorKind::Human, t0);
-        agg.process_observation(obs1);
+        let expired = agg.tick(t0 + chrono::Duration::seconds(120));
+        assert_eq!(
+            withdraw_reasons(&expired),
+            vec![("N9UNX".into(), WithdrawReason::Expired)]
+        );
+    }
 
-        let obs2 = make_obs_at("N9UNX", "VE3NEA", 7_044_000, "src1", OriginatorKind::Human, t1);
-        let e2 = agg.process_observation(obs2);
-        assert_eq!(e2.len(), 2);
-        assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
-        assert!(matches!(&e2[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+    #[test]
+    fn cap_eviction_withdraws_emitted_spot() {
+        let mut config = AggregatorConfig::default();
+        config.max_spots = 2;
+        let mut agg = Aggregator::new(default_filter(), None, config.clone(), None, None);
+
+        let t0 = Utc::now();
+        for (i, call) in ["CALL1", "CALL2"].iter().enumerate() {
+            let e = agg.process_observation(make_obs_at(
+                call,
+                "W1AW",
+                14_025_000 + i as u64 * 5_000,
+                "src1",
+                OriginatorKind::Human,
+                t0 + chrono::Duration::seconds(i as i64),
+            ));
+            assert_eq!(e.len(), 1);
+        }
+
+        // A third spot pushes out CALL1 (oldest): Withdraw first, then New.
+        let e = agg.process_observation(make_obs_at(
+            "CALL3", "W1AW", 14_040_000, "src1", OriginatorKind::Human,
+            t0 + chrono::Duration::seconds(5),
+        ));
+        assert_eq!(e.len(), 2);
+        assert_eq!(withdraw_reasons(&e[..1]), vec![("CALL1".into(), WithdrawReason::Evicted)]);
+        assert!(matches!(&e[1], DxEvent::Spot(s) if s.kind == SpotEventKind::New));
+
+        // Shrinking the cap at runtime withdraws the overflow too.
+        config.max_spots = 1;
+        let e = agg.update_aggregator_config(config);
+        assert_eq!(withdraw_reasons(&e), vec![("CALL2".into(), WithdrawReason::Evicted)]);
+        assert_eq!(agg.spot_table().len(), 1);
     }
 
     // -----------------------------------------------------------------------

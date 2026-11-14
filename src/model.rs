@@ -57,9 +57,32 @@ pub struct DxSpotEvent {
     pub kind: SpotEventKind,
     /// Monotonically increasing per SpotKey.
     pub revision: u32,
+    /// Why the spot was withdrawn. `Some` on every `Withdraw` event, `None`
+    /// on `New` and `Update`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub withdraw_reason: Option<WithdrawReason>,
+}
+
+/// Why a spot was withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum WithdrawReason {
+    /// No observation arrived within the spot TTL.
+    Expired,
+    /// The station moved; a `New` for the new frequency follows immediately.
+    Qsy,
+    /// Removed to keep the spot table within `max_spots`.
+    Evicted,
 }
 
 /// Lifecycle state of a spot event.
+///
+/// The aggregator guarantees, per [`SpotKey`]: the first event is `New`;
+/// `Update` and `Withdraw` only follow a `New`; every `New` is eventually
+/// followed by exactly one `Withdraw` (unless the feed shuts down first);
+/// and nothing follows a `Withdraw` except a fresh `New`. A consumer can
+/// therefore maintain a correct table from events alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SpotEventKind {
@@ -398,6 +421,7 @@ mod tests {
             },
             kind: SpotEventKind::New,
             revision: 1,
+            withdraw_reason: None,
         });
 
         // Just verify it constructs without panic

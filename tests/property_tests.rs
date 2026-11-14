@@ -201,3 +201,138 @@ fn resolve_mode_for_all_bands() {
         assert_eq!(mode, DxMode::SSB, "SSB expected for freq {freq}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Aggregator: spot lifecycle invariant
+// ---------------------------------------------------------------------------
+
+/// Replays a pseudo-random stream (skimmer gating, QSYs, TTL expiry, cap
+/// eviction, a runtime cap reduction) into a model consumer that keeps a
+/// table from events alone, and checks the lifecycle contract documented on
+/// `SpotEventKind`:
+///
+/// - `New` only for a key the consumer does not hold;
+/// - `Update` / `Withdraw` only for a key it does hold;
+/// - every `Withdraw` carries a reason;
+/// - at the end, the consumer's table equals the aggregator's emitted spots.
+#[test]
+fn aggregator_lifecycle_invariant() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use chrono::Utc;
+    use dxfeed::aggregator::core::{Aggregator, AggregatorConfig, IncomingObservation};
+    use dxfeed::domain::OriginatorKind;
+    use dxfeed::model::{DxEvent, SourceId, SpotEventKind, SpotKey};
+    use dxfeed::parser::spot::ParsedSpot;
+    use dxfeed::skimmer::config::SkimmerQualityConfig;
+
+    fn apply(live: &mut HashSet<SpotKey>, events: Vec<DxEvent>, counts: &mut [u64; 3]) {
+        for event in events {
+            let DxEvent::Spot(e) = event else { continue };
+            let key = e.spot.spot_key.clone();
+            match e.kind {
+                SpotEventKind::New => {
+                    counts[0] += 1;
+                    assert!(e.withdraw_reason.is_none());
+                    assert!(live.insert(key.clone()), "New for a live key: {key:?}");
+                }
+                SpotEventKind::Update => {
+                    counts[1] += 1;
+                    assert!(e.withdraw_reason.is_none());
+                    assert!(live.contains(&key), "Update for an unknown key: {key:?}");
+                }
+                SpotEventKind::Withdraw => {
+                    counts[2] += 1;
+                    assert!(e.withdraw_reason.is_some(), "Withdraw without a reason");
+                    assert!(live.remove(&key), "Withdraw for an unknown key: {key:?}");
+                }
+            }
+        }
+    }
+
+    for seed in 1..=8u64 {
+        let mut config = AggregatorConfig::default();
+        config.spot_ttl = Duration::from_secs(120);
+        config.max_spots = 150; // small enough that cap eviction happens
+        config.dedupe.emit_updates = seed % 2 == 0;
+
+        let filter = FilterConfigSerde::default().validate_and_compile().unwrap();
+        let mut agg = Aggregator::new(
+            filter,
+            Some(SkimmerQualityConfig::default()),
+            config.clone(),
+            None,
+            None,
+        );
+
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+
+        let mut live: HashSet<SpotKey> = HashSet::new();
+        let mut counts = [0u64; 3];
+        let t0 = Utc::now();
+
+        for i in 0..40_000i64 {
+            let now = t0 + chrono::Duration::milliseconds(i * 50);
+
+            // 300 stations; each drifts to a new frequency now and then
+            // (era changes every ~100 s), and reports jitter by ±200 Hz.
+            let station = next(300);
+            let era = (i as u64 / 2_000 + station) % 4;
+            let base = 14_000_000 + station * 200 + era * 30_000;
+            let freq_hz = base + next(5) * 100 - 200;
+            let human = next(10) == 0;
+            let spotter = if human {
+                format!("W{}XYZ", next(10))
+            } else {
+                format!("SK{}-#", next(12))
+            };
+
+            let obs = IncomingObservation {
+                parsed: ParsedSpot {
+                    spotter_call: spotter,
+                    dx_call: format!("DX{station}"),
+                    freq_hz,
+                    comment: None,
+                    utc_time: None,
+                },
+                source_id: SourceId("prop".into()),
+                originator_kind: if human {
+                    OriginatorKind::Human
+                } else {
+                    OriginatorKind::Skimmer
+                },
+                received_at: now,
+                skimmer_fields: None,
+            };
+            apply(&mut live, agg.process_observation(obs), &mut counts);
+
+            if i % 200 == 199 {
+                apply(&mut live, agg.tick(now), &mut counts);
+            }
+            if i == 25_000 {
+                let mut smaller = config.clone();
+                smaller.max_spots = 60;
+                apply(&mut live, agg.update_aggregator_config(smaller), &mut counts);
+            }
+        }
+
+        let emitted: HashSet<SpotKey> = agg
+            .spot_table()
+            .iter()
+            .filter(|(_, state)| state.first_emitted)
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert_eq!(live, emitted, "consumer table diverged (seed {seed})");
+
+        // The stream must actually exercise the paths under test.
+        assert!(counts[0] > 300, "too few New events (seed {seed}): {counts:?}");
+        assert!(counts[2] > 100, "too few Withdraw events (seed {seed}): {counts:?}");
+    }
+}

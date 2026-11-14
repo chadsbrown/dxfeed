@@ -59,6 +59,14 @@ place; removing it belongs with item 2.
 
 ## 2. Guaranteed lifecycle
 
+**Status: implemented** on branch `tolerance-spot-identity` (2026-11-14).
+Withdraw is emitted only, and always, for spots the consumer was sent;
+`DxSpotEvent::withdraw_reason` says why (`Expired`, `Qsy`, `Evicted`).
+`qsy_coalesce_window` and `DxFeed::set_qsy_coalesce_window()` are removed.
+`aggregator_lifecycle_invariant` in `tests/property_tests.rs` enforces the
+contract. Still open on the clogger side: withdraw by key or band, not by
+call alone.
+
 - **Why:** a consumer should be able to keep a correct table by following
   events alone. Today three paths break that:
   - **Coalesced QSY:** inside the 200 ms window the old spot is removed with

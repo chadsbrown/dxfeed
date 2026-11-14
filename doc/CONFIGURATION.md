@@ -363,7 +363,7 @@ pure frequency bucketing. The tolerance can be changed at runtime with
 |-------|------|---------|-------------|
 | `emit_updates` | `bool` | `false` | When `true`, emit `Update` events when an already-emitted spot receives new observations. When `false`, only `New` and `Withdraw` events are emitted. |
 | `min_update_interval` | `Duration` or `null` | `null` | Minimum time between `Update` emissions for the same spot. Suppresses rapid-fire updates. `null` = no cooldown (every qualifying update emits). |
-| `detect_qsy` | `bool` | `true` | When `true`, if a station is spotted at a new frequency bucket on the same band/mode, the old spot is withdrawn and a new one is emitted (`[Withdraw, New]`). |
+| `detect_qsy` | `bool` | `true` | When `true`, if a station is spotted outside `match_tolerance` of its current spot on the same band/mode, the old spot is withdrawn and a new one is emitted (`[Withdraw, New]`). The pair is always emitted. |
 
 ---
 
@@ -583,6 +583,24 @@ Lifecycle state of a spot event.
 | `New` | First time this spot passes filters and is emitted. |
 | `Update` | Meaningful change to an already-emitted spot (requires `emit_updates: true`). |
 | `Withdraw` | Spot removed due to TTL expiry, QSY detection, or capacity eviction. |
+
+Per `SpotKey`, the aggregator guarantees: the first event is `New`; `Update`
+and `Withdraw` only follow a `New`; every `New` is eventually followed by
+exactly one `Withdraw` (unless the feed shuts down first); and nothing
+follows a `Withdraw` except a fresh `New`. A consumer can maintain a correct
+table from events alone. Spots that were gated or filtered and never emitted
+are removed without a `Withdraw`.
+
+### WithdrawReason
+
+`DxSpotEvent::withdraw_reason` is set on every `Withdraw` and is `None` on
+`New` and `Update`.
+
+| Value | Description |
+|-------|-------------|
+| `Expired` | No observation arrived within `spot_ttl`. |
+| `Qsy` | The station moved outside `match_tolerance`; a `New` for the new frequency follows immediately. |
+| `Evicted` | Removed to keep the table within `max_spots`. |
 
 ---
 

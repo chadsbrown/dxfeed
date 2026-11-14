@@ -296,6 +296,9 @@ impl DxFeed {
     }
 
     /// Change the hard cap on total spots in the table.
+    ///
+    /// If the table is over the new cap, the oldest spots are evicted and a
+    /// `Withdraw` is emitted for each one the consumer had been sent.
     pub fn set_max_spots(&self, max: usize) {
         self.aggregator_config_tx
             .send_modify(|c| c.max_spots = max);
@@ -323,17 +326,6 @@ impl DxFeed {
     pub fn set_detect_qsy(&self, detect: bool) {
         self.aggregator_config_tx
             .send_modify(|c| c.dedupe.detect_qsy = detect);
-    }
-
-    /// Set the QSY hysteresis window.
-    ///
-    /// When `Some(window)`, a QSY firing within `window` of the old spot's
-    /// last emission has its Withdraw suppressed (only the New is emitted),
-    /// suppressing the DROP/SPOT churn from cluster-protocol freq
-    /// quantization and skimmer jitter. `None` always emits the pair.
-    pub fn set_qsy_coalesce_window(&self, window: Option<Duration>) {
-        self.aggregator_config_tx
-            .send_modify(|c| c.dedupe.qsy_coalesce_window = window);
     }
 
     // -- Convenience setters (skimmer) --
@@ -435,7 +427,11 @@ async fn run_aggregator_task(
             result = aggregator_config_rx.changed() => {
                 if result.is_ok() {
                     let new_config = aggregator_config_rx.borrow_and_update().clone();
-                    aggregator.update_aggregator_config(new_config);
+                    for event in aggregator.update_aggregator_config(new_config) {
+                        if event_tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
             result = skimmer_config_rx.changed() => {
