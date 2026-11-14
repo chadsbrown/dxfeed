@@ -1375,6 +1375,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Same callsign on several bands at once
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn skimmer_spots_on_two_bands_both_emit() {
+        // A multi-op station heard on 20m and 40m at once, reports
+        // alternating between the bands. Both spots must be emitted, and
+        // neither may withdraw the other.
+        let mut agg = Aggregator::new(
+            default_filter(),
+            Some(SkimmerQualityConfig::default()),
+            AggregatorConfig::default(),
+            None,
+            None,
+        );
+        let t0 = Utc::now();
+
+        let mut events = Vec::new();
+        for i in 0..24usize {
+            let freq = if i % 2 == 0 { 14_025_000 } else { 7_010_000 };
+            events.extend(agg.process_observation(make_obs_at(
+                "K3LR",
+                &format!("SK{}-#", i % 6),
+                freq,
+                "rbn",
+                OriginatorKind::Skimmer,
+                t0 + chrono::Duration::seconds(i as i64),
+            )));
+        }
+
+        let mut emitted: Vec<(SpotEventKind, Band)> = events
+            .iter()
+            .filter_map(|e| match e {
+                DxEvent::Spot(s) => Some((s.kind, s.spot.band)),
+                _ => None,
+            })
+            .collect();
+        emitted.sort_by_key(|(_, band)| *band);
+        assert_eq!(
+            emitted,
+            vec![(SpotEventKind::New, Band::B40), (SpotEventKind::New, Band::B20)]
+        );
+        assert_eq!(agg.metrics().snapshot().skimmer_tagged.qsy, 0);
+    }
+
+    // -----------------------------------------------------------------------
     // Metrics
     // -----------------------------------------------------------------------
 

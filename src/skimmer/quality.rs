@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::domain::OriginatorKind;
+use crate::domain::{Band, OriginatorKind};
+use crate::freq::freq_to_band;
 use crate::model::{SkimQualityDetail, SkimQualityTag};
 
 use super::config::SkimmerQualityConfig;
@@ -24,8 +25,11 @@ pub struct SkimmerQualityEngine {
     observations: HashMap<String, Vec<SkimObs>>,
     /// Total observation count across all keys (for hard cap enforcement).
     total_observations: usize,
-    /// Verified calls with their last known frequency and verification time.
-    verified_calls: HashMap<String, VerifiedCallState>,
+    /// Verified calls with their last known frequency and verification
+    /// time, per band. A station can be active on several bands at once
+    /// (multi-op, SO2R); keeping one entry per band stops activity on one
+    /// band being mistaken for a QSY from another.
+    verified_calls: HashMap<(String, Band), VerifiedCallState>,
 }
 
 /// A single skimmer observation recorded in the index.
@@ -94,6 +98,8 @@ impl SkimmerQualityEngine {
     ///
     /// Call this after `record_observation()` for the current spot.
     pub fn compute_tag(&mut self, dx_call: &str, freq_hz: u64, now: DateTime<Utc>) -> SkimQualityTag {
+        let verified_key = (dx_call.to_string(), freq_to_band(freq_hz));
+
         // Count distinct skimmers corroborating this call within freq+time window
         let distinct_skimmers = if self.config.compute_valid {
             self.count_distinct_skimmers(dx_call, freq_hz, now)
@@ -107,12 +113,12 @@ impl SkimmerQualityEngine {
         {
             // Check if this is a QSY from a previously verified frequency
             if self.config.compute_qsy {
-                if let Some(prev) = self.verified_calls.get(dx_call) {
+                if let Some(prev) = self.verified_calls.get(&verified_key) {
                     let freq_diff = (freq_hz as i64 - prev.last_freq_hz as i64).abs();
                     if freq_diff > self.config.qsy_freq_window_hz {
                         // Update verified state to new frequency
                         self.verified_calls.insert(
-                            dx_call.to_string(),
+                            verified_key.clone(),
                             VerifiedCallState {
                                 last_freq_hz: freq_hz,
                                 last_verified: now,
@@ -125,7 +131,7 @@ impl SkimmerQualityEngine {
 
             // Mark as verified (new or same frequency)
             self.verified_calls.insert(
-                dx_call.to_string(),
+                verified_key.clone(),
                 VerifiedCallState {
                     last_freq_hz: freq_hz,
                     last_verified: now,
@@ -151,6 +157,8 @@ impl SkimmerQualityEngine {
         freq_hz: u64,
         now: DateTime<Utc>,
     ) -> (SkimQualityTag, SkimQualityDetail) {
+        let verified_key = (dx_call.to_string(), freq_to_band(freq_hz));
+
         let distinct_skimmers = if self.config.compute_valid {
             self.count_distinct_skimmers(dx_call, freq_hz, now)
         } else {
@@ -163,12 +171,12 @@ impl SkimmerQualityEngine {
         {
             // QSY check
             if self.config.compute_qsy {
-                if let Some(prev) = self.verified_calls.get(dx_call) {
+                if let Some(prev) = self.verified_calls.get(&verified_key) {
                     let freq_diff = (freq_hz as i64 - prev.last_freq_hz as i64).abs();
                     if freq_diff > self.config.qsy_freq_window_hz {
                         let previous_freq = prev.last_freq_hz;
                         self.verified_calls.insert(
-                            dx_call.to_string(),
+                            verified_key.clone(),
                             VerifiedCallState {
                                 last_freq_hz: freq_hz,
                                 last_verified: now,
@@ -188,7 +196,7 @@ impl SkimmerQualityEngine {
             }
 
             self.verified_calls.insert(
-                dx_call.to_string(),
+                verified_key.clone(),
                 VerifiedCallState {
                     last_freq_hz: freq_hz,
                     last_verified: now,
@@ -313,7 +321,7 @@ impl SkimmerQualityEngine {
         let max_dist = self.config.similar_call_max_edit_distance as usize;
         let freq_window = self.config.busted_freq_window_hz;
 
-        for (verified_call, state) in &self.verified_calls {
+        for ((verified_call, _band), state) in &self.verified_calls {
             if verified_call == dx_call {
                 continue;
             }
@@ -526,13 +534,76 @@ mod tests {
         let tag1 = engine.compute_tag("JA1ABC", 14_025_000, now);
         assert_eq!(tag1, SkimQualityTag::Valid);
 
-        // Then: new reports on 15m (far from verified freq)
+        // Then: new reports 15 kHz up the same band (far from verified freq)
+        let later = now_plus_secs(now, 60);
+        engine.record_observation("JA1ABC", 14_040_000, "W3LPL-2", later);
+        engine.record_observation("JA1ABC", 14_040_050, "DK8JP-1", later);
+        engine.record_observation("JA1ABC", 14_040_100, "VE3NEA-3", later);
+        let tag2 = engine.compute_tag("JA1ABC", 14_040_000, later);
+        assert_eq!(tag2, SkimQualityTag::Qsy);
+    }
+
+    #[test]
+    fn verified_on_another_band_is_valid_not_qsy() {
+        let mut engine = default_engine();
+        let now = Utc::now();
+
+        // Become valid on 20m
+        engine.record_observation("JA1ABC", 14_025_000, "W3LPL-2", now);
+        engine.record_observation("JA1ABC", 14_025_050, "DK8JP-1", now);
+        engine.record_observation("JA1ABC", 14_025_100, "VE3NEA-3", now);
+        assert_eq!(engine.compute_tag("JA1ABC", 14_025_000, now), SkimQualityTag::Valid);
+
+        // The same call corroborated on 15m is a second, independent
+        // signal (multi-op / SO2R), not a QSY from 20m.
         let later = now_plus_secs(now, 60);
         engine.record_observation("JA1ABC", 21_025_000, "W3LPL-2", later);
         engine.record_observation("JA1ABC", 21_025_050, "DK8JP-1", later);
         engine.record_observation("JA1ABC", 21_025_100, "VE3NEA-3", later);
-        let tag2 = engine.compute_tag("JA1ABC", 21_025_000, later);
-        assert_eq!(tag2, SkimQualityTag::Qsy);
+        assert_eq!(engine.compute_tag("JA1ABC", 21_025_000, later), SkimQualityTag::Valid);
+    }
+
+    #[test]
+    fn interleaved_bands_stay_valid() {
+        // A multi-band station's reports alternate between bands. Each
+        // band keeps its own verified frequency, so neither is tagged Qsy.
+        let mut engine = default_engine();
+        let now = Utc::now();
+        let skimmers = ["W3LPL-2", "DK8JP-1", "VE3NEA-3", "K1TTT-1"];
+
+        let mut tags = Vec::new();
+        for i in 0..16usize {
+            let freq = if i % 2 == 0 { 14_025_000 } else { 7_010_000 };
+            let t = now_plus_secs(now, i as i64);
+            engine.record_observation("K3LR", freq, skimmers[(i / 2) % 4], t);
+            tags.push(engine.compute_tag("K3LR", freq, t));
+        }
+
+        // The first two reports per band are uncorroborated; after that
+        // every report on either band is Valid.
+        assert!(tags[..4].iter().all(|t| *t == SkimQualityTag::Unknown));
+        assert!(tags[4..].iter().all(|t| *t == SkimQualityTag::Valid), "{tags:?}");
+    }
+
+    #[test]
+    fn qsy_on_one_band_does_not_disturb_another() {
+        let mut engine = default_engine();
+        let now = Utc::now();
+        let verify = |engine: &mut SkimmerQualityEngine, freq: u64, t| {
+            for sk in ["W3LPL-2", "DK8JP-1", "VE3NEA-3"] {
+                engine.record_observation("K3LR", freq, sk, t);
+            }
+            engine.compute_tag("K3LR", freq, t)
+        };
+
+        assert_eq!(verify(&mut engine, 14_025_000, now), SkimQualityTag::Valid);
+        assert_eq!(verify(&mut engine, 7_010_000, now), SkimQualityTag::Valid);
+
+        // Moves on 20m: Qsy there...
+        let later = now_plus_secs(now, 30);
+        assert_eq!(verify(&mut engine, 14_040_000, later), SkimQualityTag::Qsy);
+        // ...while 40m is still at its verified frequency.
+        assert_eq!(verify(&mut engine, 7_010_000, later), SkimQualityTag::Valid);
     }
 
     // -----------------------------------------------------------------------
@@ -751,13 +822,13 @@ mod tests {
         engine.record_observation("JA1ABC", 14_025_100, "VE3NEA-3", now);
         engine.compute_tag("JA1ABC", 14_025_000, now);
 
-        // QSY to 15m
+        // QSY up the band
         let later = now_plus_secs(now, 60);
-        engine.record_observation("JA1ABC", 21_025_000, "W3LPL-2", later);
-        engine.record_observation("JA1ABC", 21_025_050, "DK8JP-1", later);
-        engine.record_observation("JA1ABC", 21_025_100, "VE3NEA-3", later);
+        engine.record_observation("JA1ABC", 14_040_000, "W3LPL-2", later);
+        engine.record_observation("JA1ABC", 14_040_050, "DK8JP-1", later);
+        engine.record_observation("JA1ABC", 14_040_100, "VE3NEA-3", later);
 
-        let (tag, detail) = engine.compute_tag_with_detail("JA1ABC", 21_025_000, later);
+        let (tag, detail) = engine.compute_tag_with_detail("JA1ABC", 14_040_000, later);
         assert_eq!(tag, SkimQualityTag::Qsy);
         assert_eq!(detail.previous_freq_hz, Some(14_025_000));
     }

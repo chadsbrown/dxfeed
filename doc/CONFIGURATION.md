@@ -415,7 +415,7 @@ corroboration from multiple independent skimmers.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `qsy_freq_window_hz` | `i64` | `400` | Frequency difference in Hz beyond which a previously-verified call is considered to have QSY'd. |
+| `qsy_freq_window_hz` | `i64` | `400` | Frequency difference in Hz, within one band, beyond which a previously-verified call is considered to have QSY'd. |
 
 ### Other
 
@@ -429,7 +429,7 @@ corroboration from multiple independent skimmers.
 |-----|---------|
 | `Valid` | Corroborated by the required number of distinct skimmers within the frequency/time window. |
 | `Busted` | The reported callsign is similar (by edit distance) to a verified call at a nearby frequency. Likely a decoding error. |
-| `Qsy` | A previously verified call is now being reported at a significantly different frequency. |
+| `Qsy` | A previously verified call is now being reported at a significantly different frequency on the same band. Verification is tracked per band, so a station active on several bands at once is `Valid` on each. |
 | `Unknown` | Insufficient data to classify. Typically a single skimmer report with no corroboration yet. |
 
 ---
