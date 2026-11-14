@@ -12,6 +12,7 @@ use crate::filter::config::CallsignNormalizationSerde;
 use crate::filter::decision::FilterDecision;
 use crate::filter::evaluate::evaluate;
 use crate::freq::{freq_bucket, freq_to_band, resolve_mode};
+use crate::metrics::MetricsHandle;
 use crate::model::{
     DxEvent, DxSpot, DxSpotEvent, GeoResolved, OriginatorId, SkimQualityTag, SourceId,
     SpotEventKind, SpotKey, SpotObservation, SpotView, WithdrawReason,
@@ -184,6 +185,7 @@ pub struct Aggregator {
     entity_resolver: Option<Box<dyn EntityResolver>>,
     enrichment_resolver: Option<Box<dyn EnrichmentResolver>>,
     config: AggregatorConfig,
+    metrics: MetricsHandle,
 }
 
 impl Aggregator {
@@ -209,7 +211,19 @@ impl Aggregator {
             entity_resolver,
             enrichment_resolver,
             config,
+            metrics: MetricsHandle::new(),
         }
+    }
+
+    /// Record into a shared metrics handle instead of a private one.
+    pub fn with_metrics(mut self, metrics: MetricsHandle) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// The metrics this aggregator records into.
+    pub fn metrics(&self) -> &MetricsHandle {
+        &self.metrics
     }
 
     /// Process an incoming observation through the full pipeline.
@@ -226,14 +240,17 @@ impl Aggregator {
         // itself is gated or filtered.
         let mut out = self.drain_cap_evicted();
         if out.is_empty() {
-            return events;
+            out = events;
+        } else {
+            out.extend(events);
         }
-        out.extend(events);
+        self.record_emitted(&out);
         out
     }
 
     fn process_observation_inner(&mut self, obs: IncomingObservation) -> Vec<DxEvent> {
         let now = obs.received_at;
+        self.metrics.inc_spots_received();
 
         // 1. Normalize callsigns
         let dx_call_norm = normalize_callsign(&obs.parsed.dx_call, &self.config.callsign_norm);
@@ -334,6 +351,7 @@ impl Aggregator {
             if obs.originator_kind == OriginatorKind::Skimmer {
                 engine.record_observation(&dx_call_norm, freq_hz, &spotter_call_norm, now);
                 let tag = engine.compute_tag(&dx_call_norm, freq_hz, now);
+                self.metrics.inc_skimmer_tagged(tag);
 
                 // Update spot state with quality tag
                 if let Some(state) = self.spot_table.get_mut(&key) {
@@ -352,6 +370,7 @@ impl Aggregator {
         if let Some(engine) = &self.skimmer_engine {
             let tag = skim_tag.unwrap_or(SkimQualityTag::Unknown);
             if !engine.should_emit(tag, obs.originator_kind) {
+                self.metrics.inc_skimmer_gated(tag);
                 return vec![];
             }
         }
@@ -363,12 +382,16 @@ impl Aggregator {
         };
         let view = self.build_spot_view(state, &spotter_call_norm, &obs.source_id.0, obs.originator_kind, &skim, now);
 
-        if let FilterDecision::Drop(_) = evaluate(&view, &self.filter) {
+        if let FilterDecision::Drop(reason) = evaluate(&view, &self.filter) {
+            self.metrics.inc_filtered(reason);
             return vec![];
         }
 
         // 8. Decide emission: New vs Update vs suppress
         let base_event = self.decide_emission(&key, &table_result, now);
+        if base_event.is_none() {
+            self.metrics.inc_spots_deduped();
+        }
         // -- mutable borrow from decide_emission is released here --
 
         // 9. QSY detection: if a New spot was emitted and we already have an
@@ -419,6 +442,7 @@ impl Aggregator {
             engine.evict_expired(now);
         }
 
+        self.record_emitted(&events);
         events
     }
 
@@ -453,7 +477,9 @@ impl Aggregator {
         };
         self.spot_table.update_config(table_config);
         self.config = config;
-        self.drain_cap_evicted()
+        let events = self.drain_cap_evicted();
+        self.record_emitted(&events);
+        events
     }
 
     /// Replace or toggle the skimmer quality engine at runtime.
@@ -475,6 +501,12 @@ impl Aggregator {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Count events about to be returned and refresh the table-size gauge.
+    fn record_emitted(&self, events: &[DxEvent]) {
+        self.metrics.record_events(events);
+        self.metrics.set_spot_table_size(self.spot_table.len() as u64);
+    }
 
     /// Withdraw events for emitted spots removed by the `max_spots` cap.
     fn drain_cap_evicted(&mut self) -> Vec<DxEvent> {
@@ -1340,6 +1372,69 @@ mod tests {
         let e = agg.update_aggregator_config(config);
         assert_eq!(withdraw_reasons(&e), vec![("CALL2".into(), WithdrawReason::Evicted)]);
         assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Metrics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metrics_account_for_every_observation() {
+        use crate::filter::decision::FilterDropReason;
+
+        let mut filter_cfg = FilterConfigSerde::default();
+        filter_cfg.rf.band_deny.insert(Band::B40);
+        let filter = filter_cfg.validate_and_compile().unwrap();
+
+        let mut config = AggregatorConfig::default();
+        config.spot_ttl = Duration::from_secs(60);
+        let mut agg = Aggregator::new(
+            filter,
+            Some(SkimmerQualityConfig::default()),
+            config,
+            None,
+            None,
+        );
+        let t0 = Utc::now();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+
+        // Human on 20m: New. Second human report, same spot: deduped.
+        agg.process_observation(make_obs_at("K1ABC", "W1AW", 14_025_000, "c", OriginatorKind::Human, at(0)));
+        agg.process_observation(make_obs_at("K1ABC", "VE3NEA", 14_025_100, "c", OriginatorKind::Human, at(1)));
+        // Same station 1 kHz up: QSY → Withdraw + New.
+        agg.process_observation(make_obs_at("K1ABC", "DL1ABC", 14_026_000, "c", OriginatorKind::Human, at(2)));
+        // Human on 40m: filtered (band denied).
+        agg.process_observation(make_obs_at("K2XYZ", "W1AW", 7_025_000, "c", OriginatorKind::Human, at(3)));
+        // Skimmers on 15m: two gated as Unknown, third makes it Valid → New.
+        for (i, sk) in ["SK1-#", "SK2-#", "SK3-#"].iter().enumerate() {
+            agg.process_observation(make_obs_at("K3DEF", sk, 21_025_000, "r", OriginatorKind::Skimmer, at(4 + i as i64)));
+        }
+        // Everything expires: the two emitted spots are withdrawn; the
+        // filtered 40m spot goes silently.
+        agg.tick(at(200));
+
+        let m = agg.metrics().snapshot();
+        assert_eq!(m.spots_received, 7);
+        assert_eq!(m.spots_gated, 2);
+        assert_eq!(m.skimmer_gated.unknown, 2);
+        assert_eq!(m.skimmer_tagged.unknown, 2);
+        assert_eq!(m.skimmer_tagged.valid, 1);
+        assert_eq!(m.spots_filtered, 1);
+        assert_eq!(m.filtered_by_reason, vec![(FilterDropReason::BandDenied, 1)]);
+        assert_eq!(m.spots_deduped, 1);
+        assert_eq!(m.emitted_new, 3);
+        assert_eq!(m.emitted_update, 0);
+        assert_eq!(m.withdrawn.qsy, 1);
+        assert_eq!(m.withdrawn.expired, 2);
+        assert_eq!(m.withdrawn.evicted, 0);
+        assert_eq!(m.spots_emitted, 6);
+        assert_eq!(m.spot_table_size, 0);
+
+        // Every observation ends in exactly one outcome.
+        assert_eq!(
+            m.spots_received,
+            m.spots_gated + m.spots_filtered + m.spots_deduped + m.emitted_new + m.emitted_update
+        );
     }
 
     // -----------------------------------------------------------------------

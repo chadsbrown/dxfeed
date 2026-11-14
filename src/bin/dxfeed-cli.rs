@@ -83,6 +83,11 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Print a metrics snapshot to stderr as one JSON line every N seconds
+    /// (JSON mode only; 0 disables).
+    #[arg(long, default_value = "0", global = true)]
+    metrics_interval: u64,
+
     /// Print the default FilterConfigSerde as JSON and exit.
     #[arg(long)]
     dump_default_filter: bool,
@@ -420,6 +425,12 @@ async fn run_json_mode(
     feed: &mut dxfeed::feed::DxFeed,
     cli: &Cli,
 ) {
+    // With the interval disabled, tick so rarely that it never matters.
+    let metrics_enabled = cli.metrics_interval > 0;
+    let period = Duration::from_secs(if metrics_enabled { cli.metrics_interval } else { 86_400 });
+    let mut metrics_tick = tokio::time::interval(period);
+    metrics_tick.tick().await; // the first tick fires immediately
+
     loop {
         tokio::select! {
             event = feed.next_event() => {
@@ -427,6 +438,9 @@ async fn run_json_mode(
                     Some(event) => handle_json_event(&event, cli),
                     None => break,
                 }
+            }
+            _ = metrics_tick.tick(), if metrics_enabled => {
+                print_metrics(feed);
             }
             _ = tokio::signal::ctrl_c() => {
                 if cli.verbose {
@@ -439,6 +453,23 @@ async fn run_json_mode(
                 break;
             }
         }
+    }
+
+    if metrics_enabled {
+        print_metrics(feed);
+    }
+}
+
+fn print_metrics(feed: &dxfeed::feed::DxFeed) {
+    #[derive(serde::Serialize)]
+    struct Line {
+        time: DateTime<Utc>,
+        metrics: dxfeed::metrics::DxFeedMetrics,
+    }
+    let line = Line { time: Utc::now(), metrics: feed.metrics() };
+    match serde_json::to_string(&line) {
+        Ok(json) => eprintln!("{json}"),
+        Err(e) => eprintln!("[error] metrics serialization failed: {e}"),
     }
 }
 

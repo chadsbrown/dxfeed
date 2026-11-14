@@ -93,6 +93,14 @@ call alone.
 
 ## 3. Wire up metrics
 
+**Status: implemented** on branch `tolerance-spot-identity` (2026-11-14).
+`DxFeed::metrics()` returns a `DxFeedMetrics` snapshot: received, gated (by
+tag), filtered (by reason), deduped, emitted (by kind), withdrawn (by
+reason), table size, and per-source spots, unparsed lines and reconnects.
+`dxfeed-cli --json --metrics-interval N` prints a snapshot to stderr every N
+seconds. Not yet done: clogger logging a snapshot, and the outbox depth and
+lag figures, which belong with item 4.
+
 - **Why:** there is currently no way to tell whether the library is doing its
   job, and the contest assessment depends on it. `MetricsHandle` in
   `src/metrics.rs` exists and is tested but is never referenced elsewhere.

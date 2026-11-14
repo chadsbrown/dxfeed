@@ -6,6 +6,7 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::SourceMetricsHandle;
 use crate::model::{SourceConnectionState, SourceId, SourceStatus};
 
 use super::cluster::{run_cluster_source, ClusterSourceConfig};
@@ -22,7 +23,7 @@ pub enum SourceConfig {
 }
 
 impl SourceConfig {
-    fn source_id(&self) -> &SourceId {
+    pub(crate) fn source_id(&self) -> &SourceId {
         match self {
             Self::Cluster(c) => &c.source_id,
         }
@@ -120,13 +121,14 @@ pub async fn run_supervised_source(
     backoff_config: BackoffConfig,
     tx: mpsc::Sender<SourceMessage>,
     shutdown: CancellationToken,
+    metrics: SourceMetricsHandle,
 ) {
     let mut backoff = BackoffState::new(backoff_config);
     let source_id = config.source_id().clone();
 
     loop {
         // Run the source
-        let result = run_source(&config, tx.clone(), shutdown.clone()).await;
+        let result = run_source(&config, tx.clone(), shutdown.clone(), metrics.clone()).await;
 
         if shutdown.is_cancelled() {
             let _ = tx
@@ -153,6 +155,7 @@ pub async fn run_supervised_source(
             }
             Err(ref e) => {
                 let delay = backoff.next_delay();
+                metrics.inc_reconnects();
 
                 let _ = tx
                     .send(SourceMessage::Status(SourceStatus {
@@ -193,6 +196,7 @@ pub async fn run_supervised_source(
             Ok(()) => {
                 // Clean EOF: reconnect immediately (reset backoff since connection was healthy)
                 backoff.reset();
+                metrics.inc_reconnects();
 
                 let _ = tx
                     .send(SourceMessage::Status(SourceStatus {
@@ -225,9 +229,10 @@ async fn run_source(
     config: &SourceConfig,
     tx: mpsc::Sender<SourceMessage>,
     shutdown: CancellationToken,
+    metrics: SourceMetricsHandle,
 ) -> Result<(), SourceError> {
     match config {
-        SourceConfig::Cluster(c) => run_cluster_source(c.clone(), tx, shutdown).await,
+        SourceConfig::Cluster(c) => run_cluster_source(c.clone(), tx, shutdown, metrics).await,
     }
 }
 
@@ -332,7 +337,7 @@ mod tests {
 
         let shutdown_clone = shutdown.clone();
         let supervisor = tokio::spawn(async move {
-            run_supervised_source(config, test_backoff(), tx, shutdown_clone).await;
+            run_supervised_source(config, test_backoff(), tx, shutdown_clone, SourceMetricsHandle::default()).await;
         });
 
         // Collect messages until we get a spot
@@ -394,7 +399,7 @@ mod tests {
 
         let shutdown_clone = shutdown.clone();
         let supervisor = tokio::spawn(async move {
-            run_supervised_source(config, test_backoff(), tx, shutdown_clone).await;
+            run_supervised_source(config, test_backoff(), tx, shutdown_clone, SourceMetricsHandle::default()).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
