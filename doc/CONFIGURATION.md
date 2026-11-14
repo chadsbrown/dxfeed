@@ -307,6 +307,7 @@ Controls how observations are aggregated into spots.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `freq_bucket` | `FreqBucketConfig` | see below | Frequency bucketing widths per mode. |
+| `match_tolerance` | `MatchToleranceConfig` | see below | How close in frequency an observation must be to an existing spot to count as that spot. |
 | `callsign_norm` | `CallsignNormalization` | see below | Callsign normalization rules (shared with filter config). |
 | `dedupe` | `DedupeConfig` | see below | Deduplication and emission control. |
 | `spot_ttl` | `Duration` | `900s` (15 min) | Time-to-live for spots. Spots not updated within this window are evicted and a `Withdraw` event is emitted. |
@@ -327,6 +328,32 @@ varies by mode:
 | `cw_bucket_hz` | `u64` | `10` | CW frequency bucket width in Hz. Two CW spots within 10 Hz of each other (after bucketing) are the same spot. |
 | `ssb_bucket_hz` | `u64` | `1000` | SSB frequency bucket width in Hz. |
 | `dig_bucket_hz` | `u64` | `100` | Digital mode frequency bucket width in Hz. |
+
+### Spot Matching (`match_tolerance`)
+
+**Type:** `MatchToleranceConfig`
+
+An observation is attached to an existing spot for the same normalized
+callsign, band and mode when its frequency is within the tolerance
+(inclusive) of the frequency at which that spot was first seen (its anchor).
+The anchor is fixed for the spot's lifetime, so a run of reports cannot walk
+a spot across the band. An observation outside the tolerance is a different
+spot; if the existing spot was already emitted, that is a QSY (`Withdraw`
+then `New`).
+
+When the already-emitted spot is within tolerance it always wins; otherwise
+the spot with the nearest anchor is used. The frequency bucket then only
+decides the key a brand-new spot is filed under.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cw_hz` | `u64` | `300` | CW tolerance in Hz. |
+| `ssb_hz` | `u64` | `1000` | SSB tolerance in Hz (also used for AM, FM and unknown modes). |
+| `dig_hz` | `u64` | `100` | Digital mode tolerance in Hz. |
+
+Setting a value to `0` disables matching for that mode and falls back to
+pure frequency bucketing. The tolerance can be changed at runtime with
+`DxFeed::set_match_tolerance()`; existing spots keep their keys.
 
 ### Deduplication (`dedupe`)
 

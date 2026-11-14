@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::aggregator::core::{Aggregator, AggregatorConfig};
+use crate::aggregator::core::{Aggregator, AggregatorConfig, MatchToleranceConfig};
 use crate::filter::compiled::FilterConfig;
 use crate::filter::config::FilterConfigSerde;
 use crate::filter::error::FilterConfigError;
@@ -284,6 +284,15 @@ impl DxFeed {
     pub fn set_emit_updates(&self, emit: bool) {
         self.aggregator_config_tx
             .send_modify(|c| c.dedupe.emit_updates = emit);
+    }
+
+    /// Change the spot-identity match tolerance (Hz, per mode).
+    ///
+    /// Safe to change at runtime: existing spots keep their keys, and the
+    /// new tolerance applies to observations from then on.
+    pub fn set_match_tolerance(&self, tolerance: MatchToleranceConfig) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.match_tolerance = tolerance);
     }
 
     /// Change the hard cap on total spots in the table.

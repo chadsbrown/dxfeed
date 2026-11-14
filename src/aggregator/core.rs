@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::callsign::normalize_callsign;
-use crate::domain::{ModePolicy, OriginatorKind};
+use crate::domain::{DxMode, ModePolicy, OriginatorKind};
 use crate::filter::compiled::FilterConfig;
 use crate::filter::config::CallsignNormalizationSerde;
 use crate::filter::decision::FilterDecision;
@@ -46,6 +46,49 @@ impl Default for FreqBucketConfig {
             cw_bucket_hz: 200,
             ssb_bucket_hz: 1000,
             dig_bucket_hz: 100,
+        }
+    }
+}
+
+/// Spot-identity matching tolerance, per mode.
+///
+/// An observation is attached to an existing spot for the same callsign,
+/// band and mode when its frequency is within this many Hz (inclusive) of
+/// the frequency at which that spot was first seen. Outside the tolerance it
+/// is a different spot, and — if the existing spot was already emitted — a
+/// QSY. This replaces fixed frequency buckets as the test for "same spot":
+/// a station sitting on a bucket edge no longer flips between two keys as
+/// skimmers disagree by 100 Hz.
+///
+/// `0` disables matching for that mode and falls back to pure bucketing
+/// (see [`FreqBucketConfig`]).
+#[derive(Debug, Clone)]
+pub struct MatchToleranceConfig {
+    pub cw_hz: u64,
+    pub ssb_hz: u64,
+    pub dig_hz: u64,
+}
+
+impl Default for MatchToleranceConfig {
+    fn default() -> Self {
+        Self {
+            cw_hz: 300,
+            // SSB and digital default to their bucket widths, which keeps
+            // their behaviour close to what bucketing alone gave.
+            ssb_hz: 1000,
+            dig_hz: 100,
+        }
+    }
+}
+
+impl MatchToleranceConfig {
+    /// Tolerance for a mode. AM, FM and Unknown use the SSB value, matching
+    /// how bucket sizes are chosen.
+    pub fn for_mode(&self, mode: DxMode) -> u64 {
+        match mode {
+            DxMode::CW => self.cw_hz,
+            DxMode::DIG => self.dig_hz,
+            _ => self.ssb_hz,
         }
     }
 }
@@ -91,7 +134,12 @@ impl Default for DedupeConfig {
 /// Full aggregator configuration.
 #[derive(Debug, Clone)]
 pub struct AggregatorConfig {
+    /// Bucket widths. With matching enabled these only decide the key a
+    /// brand-new spot is filed under; see `match_tolerance`.
     pub freq_bucket: FreqBucketConfig,
+    /// How close in frequency an observation must be to an existing spot
+    /// for the same call/band/mode to count as that spot.
+    pub match_tolerance: MatchToleranceConfig,
     pub callsign_norm: CallsignNormalizationSerde,
     pub dedupe: DedupeConfig,
     pub spot_ttl: Duration,
@@ -105,6 +153,7 @@ impl Default for AggregatorConfig {
     fn default() -> Self {
         Self {
             freq_bucket: FreqBucketConfig::default(),
+            match_tolerance: MatchToleranceConfig::default(),
             callsign_norm: CallsignNormalizationSerde::default(),
             dedupe: DedupeConfig::default(),
             spot_ttl: Duration::from_secs(900),
@@ -204,12 +253,24 @@ impl Aggregator {
             self.config.freq_bucket.dig_bucket_hz,
         );
 
-        // 3. Build SpotKey
-        let key = SpotKey {
+        // 3. Build SpotKey. The bucket key is where a brand-new spot is
+        //    filed; if this (call, band, mode) already has a spot whose
+        //    anchor frequency is within the match tolerance, the observation
+        //    belongs to that spot instead.
+        let bucket_key = SpotKey {
             dx_call_norm: dx_call_norm.clone(),
             band,
             mode,
             freq_bucket_hz: bucket,
+        };
+        let tolerance = self.config.match_tolerance.for_mode(mode);
+        let key = if tolerance == 0 || self.spot_table.get(&bucket_key).is_some() {
+            bucket_key
+        } else {
+            self.spot_table
+                .find_match(&CallBandModeKey::from(&bucket_key), freq_hz, tolerance)
+                .cloned()
+                .unwrap_or(bucket_key)
         };
 
         // Extract skimmer fields
@@ -1252,6 +1313,214 @@ mod tests {
         assert_eq!(e2.len(), 2);
         assert!(matches!(&e2[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
         assert!(matches!(&e2[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tolerance-based spot identity (match_tolerance)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bucket_edge_reports_stay_one_spot() {
+        // 14_024_900 and 14_025_000 fall in different 200 Hz buckets, but
+        // are 100 Hz apart — well inside the 300 Hz default tolerance.
+        let mut agg = default_aggregator();
+        let t0 = Utc::now();
+
+        let mut events = Vec::new();
+        for i in 0..20i64 {
+            let freq = if i % 2 == 0 { 14_024_900 } else { 14_025_000 };
+            let obs = make_obs_at(
+                "K1ABC",
+                &format!("SPOT{i}"),
+                freq,
+                "src1",
+                OriginatorKind::Human,
+                t0 + chrono::Duration::seconds(2 * i),
+            );
+            events.extend(agg.process_observation(obs));
+        }
+
+        assert_eq!(events.len(), 1, "only the first report should emit");
+        assert!(matches!(&events[0], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+        assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    #[test]
+    fn matched_observations_accumulate_on_one_spot() {
+        let mut agg = default_aggregator();
+        let t0 = Utc::now();
+
+        let first = agg.process_observation(make_obs_at(
+            "K1ABC", "W1AW", 14_024_900, "src1", OriginatorKind::Human, t0,
+        ));
+        let key = match &first[0] {
+            DxEvent::Spot(e) => e.spot.spot_key.clone(),
+            _ => panic!("expected Spot event"),
+        };
+
+        agg.process_observation(make_obs_at(
+            "K1ABC", "VE3NEA", 14_025_100, "src1", OriginatorKind::Human, t0,
+        ));
+
+        let state = agg.spot_table().get(&key).unwrap();
+        assert_eq!(state.spot.observations.len(), 2);
+        assert_eq!(state.spot.unique_originators, 2);
+        // Displayed frequency follows the latest report; the anchor does not.
+        assert_eq!(state.spot.freq_hz, 14_025_100);
+        assert_eq!(state.anchor_freq_hz, 14_024_900);
+    }
+
+    #[test]
+    fn tolerance_is_inclusive_and_beyond_it_is_qsy() {
+        let mut agg = default_aggregator();
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(5);
+        let t2 = t0 + chrono::Duration::seconds(10);
+
+        agg.process_observation(make_obs_at(
+            "K1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human, t0,
+        ));
+
+        // Exactly 300 Hz away: same spot.
+        let at_edge = agg.process_observation(make_obs_at(
+            "K1ABC", "VE3NEA", 14_025_300, "src1", OriginatorKind::Human, t1,
+        ));
+        assert!(at_edge.is_empty());
+
+        // 400 Hz from the anchor: a QSY, even though it is only 100 Hz from
+        // the previous report — the anchor does not drift.
+        let beyond = agg.process_observation(make_obs_at(
+            "K1ABC", "DL1ABC", 14_025_400, "src1", OriginatorKind::Human, t2,
+        ));
+        assert_eq!(beyond.len(), 2);
+        assert!(matches!(&beyond[0], DxEvent::Spot(e) if e.kind == SpotEventKind::Withdraw));
+        assert!(matches!(&beyond[1], DxEvent::Spot(e) if e.kind == SpotEventKind::New));
+        assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    #[test]
+    fn tolerance_does_not_merge_other_calls_or_bands() {
+        let mut agg = default_aggregator();
+
+        let a = agg.process_observation(make_obs(
+            "K1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human,
+        ));
+        let b = agg.process_observation(make_obs(
+            "K1ABD", "W1AW", 14_025_000, "src1", OriginatorKind::Human,
+        ));
+        let c = agg.process_observation(make_obs(
+            "K1ABC", "W1AW", 7_025_000, "src1", OriginatorKind::Human,
+        ));
+
+        assert_eq!((a.len(), b.len(), c.len()), (1, 1, 1));
+        assert_eq!(agg.spot_table().len(), 3);
+    }
+
+    #[test]
+    fn tolerance_is_configurable() {
+        let mut config = AggregatorConfig::default();
+        config.match_tolerance.cw_hz = 1_000;
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        agg.process_observation(make_obs(
+            "K1ABC", "W1AW", 14_025_000, "src1", OriginatorKind::Human,
+        ));
+        // 800 Hz away: a QSY at the default 300 Hz, the same spot at 1 kHz.
+        let e = agg.process_observation(make_obs(
+            "K1ABC", "VE3NEA", 14_025_800, "src1", OriginatorKind::Human,
+        ));
+        assert!(e.is_empty());
+        assert_eq!(agg.spot_table().len(), 1);
+    }
+
+    #[test]
+    fn zero_tolerance_falls_back_to_buckets() {
+        let mut config = AggregatorConfig::default();
+        config.match_tolerance.cw_hz = 0;
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(5);
+
+        agg.process_observation(make_obs_at(
+            "K1ABC", "W1AW", 14_024_900, "src1", OriginatorKind::Human, t0,
+        ));
+        // Adjacent 200 Hz bucket → treated as a QSY, as before matching.
+        let e = agg.process_observation(make_obs_at(
+            "K1ABC", "VE3NEA", 14_025_000, "src1", OriginatorKind::Human, t1,
+        ));
+        assert_eq!(e.len(), 2);
+    }
+
+    #[test]
+    fn emitted_spot_wins_over_nearer_unemitted_one() {
+        // With skimmer gating, an unverified report can leave an unemitted
+        // entry near an emitted spot. Later reports within tolerance of the
+        // emitted spot must stay with it rather than promote the stray.
+        let mut agg = Aggregator::new(
+            default_filter(),
+            Some(SkimmerQualityConfig::default()),
+            AggregatorConfig::default(),
+            None,
+            None,
+        );
+        let t0 = Utc::now();
+
+        // Stray, unverified report 500 Hz up: its own (unemitted) entry.
+        assert!(agg
+            .process_observation(make_obs_at(
+                "K1ABC", "SKIM9", 14_025_500, "rbn", OriginatorKind::Skimmer, t0,
+            ))
+            .is_empty());
+
+        // Three skimmers verify the station at 14_025_000 → New.
+        let mut emitted = Vec::new();
+        for (i, sk) in ["SKIM1", "SKIM2", "SKIM3"].iter().enumerate() {
+            emitted.extend(agg.process_observation(make_obs_at(
+                "K1ABC",
+                sk,
+                14_025_000,
+                "rbn",
+                OriginatorKind::Skimmer,
+                t0 + chrono::Duration::seconds(i as i64 + 1),
+            )));
+        }
+        assert_eq!(emitted.len(), 1);
+
+        // 14_025_300 is 300 Hz from the emitted anchor and 200 Hz from the
+        // stray. It stays with the emitted spot: no QSY.
+        let e = agg.process_observation(make_obs_at(
+            "K1ABC",
+            "SKIM4",
+            14_025_300,
+            "rbn",
+            OriginatorKind::Skimmer,
+            t0 + chrono::Duration::seconds(10),
+        ));
+        assert!(e.is_empty(), "should not flip to the stray entry");
+    }
+
+    #[test]
+    fn expired_spot_is_not_matched() {
+        let mut config = AggregatorConfig::default();
+        config.spot_ttl = Duration::from_secs(60);
+        let mut agg = Aggregator::new(default_filter(), None, config, None, None);
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(120);
+
+        agg.process_observation(make_obs_at(
+            "K1ABC", "W1AW", 14_024_900, "src1", OriginatorKind::Human, old,
+        ));
+        agg.tick(now);
+        assert_eq!(agg.spot_table().len(), 0);
+
+        // The index must not hand back the evicted key.
+        let e = agg.process_observation(make_obs_at(
+            "K1ABC", "VE3NEA", 14_025_000, "src1", OriginatorKind::Human, now,
+        ));
+        assert_eq!(e.len(), 1);
+        assert!(matches!(&e[0], DxEvent::Spot(s) if s.kind == SpotEventKind::New
+            && s.spot.spot_key.freq_bucket_hz == 14_025_000));
     }
 
     #[test]
