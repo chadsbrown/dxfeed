@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::aggregator::core::IncomingObservation;
 use crate::callsign::is_likely_skimmer;
 use crate::domain::OriginatorKind;
+use crate::metrics::SourceMetricsHandle;
 use crate::model::{DxAnnounce, SourceConnectionState, SourceId, SourceStatus};
 use crate::parser::spot::{parse_line, parse_skimmer_comment, ParsedLine};
 
@@ -87,6 +88,7 @@ pub async fn run_cluster_source(
     config: ClusterSourceConfig,
     tx: mpsc::Sender<SourceMessage>,
     shutdown: CancellationToken,
+    metrics: SourceMetricsHandle,
 ) -> Result<(), SourceError> {
     // Notify: connecting
     let _ = tx
@@ -175,6 +177,7 @@ pub async fn run_cluster_source(
                         };
 
                         let skimmer_fields = parsed.comment.as_deref().map(parse_skimmer_comment);
+                        metrics.inc_spots_received();
 
                         let msg = SourceMessage::Observation(IncomingObservation {
                             parsed,
@@ -197,7 +200,12 @@ pub async fn run_cluster_source(
                             }))
                             .await;
                     }
-                    ParsedLine::Prompt(_) | ParsedLine::Propagation(_) | ParsedLine::Unknown(_) => {
+                    ParsedLine::Unknown(_) => {
+                        // Dropped, but counted: a node whose spot format
+                        // the parser does not recognise shows up here.
+                        metrics.inc_unparsed_lines();
+                    }
+                    ParsedLine::Prompt(_) | ParsedLine::Propagation(_) => {
                         // Silently dropped
                     }
                 }
@@ -372,7 +380,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
 
-        let client = tokio::spawn(run_cluster_source(config, tx, shutdown.clone()));
+        let client = tokio::spawn(run_cluster_source(config, tx, shutdown.clone(), SourceMetricsHandle::default()));
 
         // Collect messages
         let mut observations = Vec::new();
@@ -426,7 +434,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let shutdown_clone = shutdown.clone();
-        let client = tokio::spawn(run_cluster_source(config, tx, shutdown_clone));
+        let client = tokio::spawn(run_cluster_source(config, tx, shutdown_clone, SourceMetricsHandle::default()));
 
         // Give it time to connect, then shutdown
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -472,7 +480,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
 
-        let result = run_cluster_source(config, tx, shutdown).await;
+        let result = run_cluster_source(config, tx, shutdown, SourceMetricsHandle::default()).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         server.await.unwrap();
@@ -498,7 +506,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
 
-        tokio::spawn(run_cluster_source(config, tx, shutdown));
+        tokio::spawn(run_cluster_source(config, tx, shutdown, SourceMetricsHandle::default()));
 
         let mut observations = Vec::new();
         while let Some(msg) = rx.recv().await {
@@ -534,7 +542,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
 
-        tokio::spawn(run_cluster_source(config, tx, shutdown));
+        tokio::spawn(run_cluster_source(config, tx, shutdown, SourceMetricsHandle::default()));
 
         let mut observations = Vec::new();
         while let Some(msg) = rx.recv().await {

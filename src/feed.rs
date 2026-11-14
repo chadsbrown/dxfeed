@@ -12,10 +12,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::aggregator::core::{Aggregator, AggregatorConfig};
+use crate::aggregator::core::{Aggregator, AggregatorConfig, MatchToleranceConfig};
 use crate::filter::compiled::FilterConfig;
 use crate::filter::config::FilterConfigSerde;
 use crate::filter::error::FilterConfigError;
+use crate::metrics::{DxFeedMetrics, MetricsHandle};
 use crate::model::DxEvent;
 use crate::resolver::enrichment::EnrichmentResolver;
 use crate::resolver::entity::EntityResolver;
@@ -150,6 +151,7 @@ impl DxFeedBuilder {
 
         let compiled_filter = self.filter.validate_and_compile()?;
         let shutdown = CancellationToken::new();
+        let metrics = MetricsHandle::new();
 
         // Source → aggregator channel
         let (source_tx, source_rx) = mpsc::channel(self.source_channel_capacity);
@@ -174,8 +176,9 @@ impl DxFeedBuilder {
             let tx = source_tx.clone();
             let token = shutdown.clone();
             let backoff = self.backoff.clone();
+            let source_metrics = metrics.source(source.source_id());
             let handle = tokio::spawn(async move {
-                run_supervised_source(source, backoff, tx, token).await;
+                run_supervised_source(source, backoff, tx, token, source_metrics).await;
             });
             source_handles.push(handle);
         }
@@ -197,11 +200,13 @@ impl DxFeedBuilder {
             self.enrichment_resolver,
             agg_shutdown,
             self.tick_interval,
+            metrics.clone(),
         ));
 
         Ok(DxFeed {
             event_rx,
             shutdown,
+            metrics,
             filter_tx,
             aggregator_config_tx,
             skimmer_config_tx,
@@ -222,6 +227,7 @@ impl DxFeedBuilder {
 pub struct DxFeed {
     event_rx: mpsc::Receiver<DxEvent>,
     shutdown: CancellationToken,
+    metrics: MetricsHandle,
     filter_tx: watch::Sender<FilterConfig>,
     aggregator_config_tx: watch::Sender<AggregatorConfig>,
     skimmer_config_tx: watch::Sender<Option<SkimmerQualityConfig>>,
@@ -234,6 +240,13 @@ impl DxFeed {
     /// and all pending events have been consumed.
     pub async fn next_event(&mut self) -> Option<DxEvent> {
         self.event_rx.recv().await
+    }
+
+    /// Take a snapshot of the pipeline counters: observations received,
+    /// gated, filtered (by reason), deduplicated and emitted, plus per-source
+    /// counts. Cheap; safe to call as often as wanted.
+    pub fn metrics(&self) -> DxFeedMetrics {
+        self.metrics.snapshot()
     }
 
     /// Request clean shutdown of all sources and the aggregator.
@@ -286,7 +299,19 @@ impl DxFeed {
             .send_modify(|c| c.dedupe.emit_updates = emit);
     }
 
+    /// Change the spot-identity match tolerance (Hz, per mode).
+    ///
+    /// Safe to change at runtime: existing spots keep their keys, and the
+    /// new tolerance applies to observations from then on.
+    pub fn set_match_tolerance(&self, tolerance: MatchToleranceConfig) {
+        self.aggregator_config_tx
+            .send_modify(|c| c.match_tolerance = tolerance);
+    }
+
     /// Change the hard cap on total spots in the table.
+    ///
+    /// If the table is over the new cap, the oldest spots are evicted and a
+    /// `Withdraw` is emitted for each one the consumer had been sent.
     pub fn set_max_spots(&self, max: usize) {
         self.aggregator_config_tx
             .send_modify(|c| c.max_spots = max);
@@ -314,17 +339,6 @@ impl DxFeed {
     pub fn set_detect_qsy(&self, detect: bool) {
         self.aggregator_config_tx
             .send_modify(|c| c.dedupe.detect_qsy = detect);
-    }
-
-    /// Set the QSY hysteresis window.
-    ///
-    /// When `Some(window)`, a QSY firing within `window` of the old spot's
-    /// last emission has its Withdraw suppressed (only the New is emitted),
-    /// suppressing the DROP/SPOT churn from cluster-protocol freq
-    /// quantization and skimmer jitter. `None` always emits the pair.
-    pub fn set_qsy_coalesce_window(&self, window: Option<Duration>) {
-        self.aggregator_config_tx
-            .send_modify(|c| c.dedupe.qsy_coalesce_window = window);
     }
 
     // -- Convenience setters (skimmer) --
@@ -379,13 +393,15 @@ async fn run_aggregator_task(
     enrichment_resolver: Option<Box<dyn EnrichmentResolver>>,
     shutdown: CancellationToken,
     tick_interval: Duration,
+    metrics: MetricsHandle,
 ) {
     let initial_filter = filter_rx.borrow_and_update().clone();
     // Mark initial values as seen so we don't fire immediately
     aggregator_config_rx.borrow_and_update();
     skimmer_config_rx.borrow_and_update();
 
-    let mut aggregator = Aggregator::new(initial_filter, skimmer_config, config, entity_resolver, enrichment_resolver);
+    let mut aggregator = Aggregator::new(initial_filter, skimmer_config, config, entity_resolver, enrichment_resolver)
+        .with_metrics(metrics);
     let mut tick = tokio::time::interval(tick_interval);
 
     loop {
@@ -426,7 +442,11 @@ async fn run_aggregator_task(
             result = aggregator_config_rx.changed() => {
                 if result.is_ok() {
                     let new_config = aggregator_config_rx.borrow_and_update().clone();
-                    aggregator.update_aggregator_config(new_config);
+                    for event in aggregator.update_aggregator_config(new_config) {
+                        if event_tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
             result = skimmer_config_rx.changed() => {
@@ -554,6 +574,13 @@ mod tests {
                 _ = &mut timeout => break,
             }
         }
+
+        let metrics = feed.metrics();
+        assert_eq!(metrics.spots_received, 1);
+        assert_eq!(metrics.emitted_new, 1);
+        assert_eq!(metrics.sources.len(), 1);
+        assert_eq!(metrics.sources[0].source_id, SourceId("test".into()));
+        assert_eq!(metrics.sources[0].spots_received, 1);
 
         feed.shutdown();
         server.await.unwrap();

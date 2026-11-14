@@ -76,6 +76,11 @@ pub struct SpotState {
     pub last_emitted_revision: u32,
     /// Current revision (incremented on each new observation).
     pub revision: u32,
+    /// Frequency of the observation that created this spot. Fixed for the
+    /// spot's lifetime; tolerance matching compares against this (not the
+    /// latest reported frequency) so a run of reports cannot walk a spot
+    /// across the band.
+    pub anchor_freq_hz: u64,
     /// Timestamp of the last emitted event (New or Update) for cooldown.
     pub last_emitted_at: Option<DateTime<Utc>>,
     /// Set of unique originator callsigns (all kinds).
@@ -96,6 +101,30 @@ pub struct SpotState {
     pub in_callbook: Option<bool>,
     /// Enrichment: club memberships for the DX callsign.
     pub memberships: Option<BTreeSet<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// RemovedSpot
+// ---------------------------------------------------------------------------
+
+/// A spot that has been removed from the table.
+#[derive(Debug)]
+pub struct RemovedSpot {
+    pub spot: DxSpot,
+    pub revision: u32,
+    /// Whether the consumer was ever sent a `New` for this spot. Only
+    /// emitted spots are owed a `Withdraw`.
+    pub was_emitted: bool,
+}
+
+impl From<SpotState> for RemovedSpot {
+    fn from(state: SpotState) -> Self {
+        Self {
+            spot: state.spot,
+            revision: state.revision,
+            was_emitted: state.first_emitted,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +168,12 @@ pub struct SpotTable {
     /// Secondary index: maps (call, band, mode) → the currently-emitted SpotKey.
     /// Used by the aggregator for QSY detection.
     emitted_index: HashMap<CallBandModeKey, SpotKey>,
+    /// Secondary index: maps (call, band, mode) → every SpotKey in the table
+    /// for that triple (emitted or not). Used for tolerance matching.
+    key_index: HashMap<CallBandModeKey, Vec<SpotKey>>,
+    /// Spots removed to enforce `max_spots`, waiting for the aggregator to
+    /// collect them via [`take_cap_evicted`](Self::take_cap_evicted).
+    cap_evicted: Vec<RemovedSpot>,
     config: SpotTableConfig,
 }
 
@@ -147,6 +182,8 @@ impl SpotTable {
         Self {
             entries: HashMap::new(),
             emitted_index: HashMap::new(),
+            key_index: HashMap::new(),
+            cap_evicted: Vec::new(),
             config,
         }
     }
@@ -232,6 +269,7 @@ impl SpotTable {
                 first_emitted: false,
                 last_emitted_revision: 0,
                 revision: 1,
+                anchor_freq_hz: input.freq_hz,
                 last_emitted_at: None,
                 originator_set,
                 human_originator_set,
@@ -245,6 +283,10 @@ impl SpotTable {
             };
 
             let key = input.key.clone();
+            self.key_index
+                .entry(CallBandModeKey::from(&key))
+                .or_default()
+                .push(key.clone());
             self.entries.insert(input.key, state);
             SpotTableResult::NewSpot(key)
         }
@@ -252,9 +294,9 @@ impl SpotTable {
 
     /// Evict all spots whose `last_seen` is older than TTL relative to `now`.
     ///
-    /// Returns the spot data and revision of evicted spots (for Withdraw event
-    /// emission).
-    pub fn evict_expired(&mut self, now: DateTime<Utc>) -> Vec<(DxSpot, u32)> {
+    /// Returns the evicted spots; the caller emits a Withdraw for those that
+    /// had been emitted.
+    pub fn evict_expired(&mut self, now: DateTime<Utc>) -> Vec<RemovedSpot> {
         let ttl_secs = self.config.ttl.as_secs() as i64;
 
         let expired_keys: Vec<SpotKey> = self
@@ -270,12 +312,8 @@ impl SpotTable {
             .into_iter()
             .filter_map(|key| {
                 let state = self.entries.remove(&key)?;
-                // Clean emitted index if it points to this evicted key
-                let cbm = CallBandModeKey::from(&key);
-                if self.emitted_index.get(&cbm) == Some(&key) {
-                    self.emitted_index.remove(&cbm);
-                }
-                Some((state.spot, state.revision))
+                self.unindex(&key);
+                Some(RemovedSpot::from(state))
             })
             .collect()
     }
@@ -296,6 +334,39 @@ impl SpotTable {
         self.entries.is_empty()
     }
 
+    // -- Tolerance matching ----------------------------------------------------
+
+    /// Find an existing spot for this (call, band, mode) whose anchor
+    /// frequency is within `tolerance_hz` of `freq_hz`.
+    ///
+    /// The currently-emitted spot wins if it is within tolerance (so a
+    /// station the consumer already sees keeps its identity); otherwise the
+    /// spot with the nearest anchor is returned.
+    pub fn find_match(
+        &self,
+        cbm: &CallBandModeKey,
+        freq_hz: u64,
+        tolerance_hz: u64,
+    ) -> Option<&SpotKey> {
+        let within = |key: &SpotKey| -> Option<u64> {
+            let dist = self.entries.get(key)?.anchor_freq_hz.abs_diff(freq_hz);
+            (dist <= tolerance_hz).then_some(dist)
+        };
+
+        if let Some(emitted) = self.emitted_index.get(cbm) {
+            if within(emitted).is_some() {
+                return Some(emitted);
+            }
+        }
+
+        self.key_index
+            .get(cbm)?
+            .iter()
+            .filter_map(|key| within(key).map(|dist| (dist, key)))
+            .min_by_key(|(dist, _)| *dist)
+            .map(|(_, key)| key)
+    }
+
     // -- Emitted index (QSY detection support) --------------------------------
 
     /// Record that a spot at `key` has been emitted, updating the secondary
@@ -311,14 +382,11 @@ impl SpotTable {
     }
 
     /// Remove a spot from the table and clean up the emitted index if it
-    /// points to this key. Returns the spot data and revision if found.
-    pub fn remove_spot(&mut self, key: &SpotKey) -> Option<(DxSpot, u32)> {
+    /// points to this key. Returns the removed spot if found.
+    pub fn remove_spot(&mut self, key: &SpotKey) -> Option<RemovedSpot> {
         let state = self.entries.remove(key)?;
-        let cbm = CallBandModeKey::from(key);
-        if self.emitted_index.get(&cbm) == Some(key) {
-            self.emitted_index.remove(&cbm);
-        }
-        Some((state.spot, state.revision))
+        self.unindex(key);
+        Some(RemovedSpot::from(state))
     }
 
     /// Replace the spot table configuration at runtime.
@@ -341,11 +409,37 @@ impl SpotTable {
             .map(|(k, _)| k.clone());
 
         if let Some(key) = oldest_key {
-            self.entries.remove(&key);
-            // Clean emitted index if it points to this evicted key
-            let cbm = CallBandModeKey::from(&key);
-            if self.emitted_index.get(&cbm) == Some(&key) {
-                self.emitted_index.remove(&cbm);
+            if let Some(state) = self.entries.remove(&key) {
+                self.unindex(&key);
+                self.cap_evicted.push(RemovedSpot::from(state));
+            }
+        }
+    }
+
+    /// Take the spots removed to enforce `max_spots` since the last call.
+    ///
+    /// Cap eviction happens inside [`ingest`](Self::ingest) and
+    /// [`update_config`](Self::update_config); the caller must collect the
+    /// result after either and emit a Withdraw for spots that were emitted.
+    pub fn take_cap_evicted(&mut self) -> Vec<RemovedSpot> {
+        std::mem::take(&mut self.cap_evicted)
+    }
+
+    /// Iterate over every spot in the table (emitted or not).
+    pub fn iter(&self) -> impl Iterator<Item = (&SpotKey, &SpotState)> {
+        self.entries.iter()
+    }
+
+    /// Drop a removed key from both secondary indexes.
+    fn unindex(&mut self, key: &SpotKey) {
+        let cbm = CallBandModeKey::from(key);
+        if self.emitted_index.get(&cbm) == Some(key) {
+            self.emitted_index.remove(&cbm);
+        }
+        if let Some(keys) = self.key_index.get_mut(&cbm) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.key_index.remove(&cbm);
             }
         }
     }
@@ -740,6 +834,12 @@ mod tests {
         let key1 = make_key("CALL1", 14_025_000, DxMode::CW);
         assert!(table.get(&key1).is_none(), "oldest spot should be evicted");
 
+        // ...and handed back exactly once for Withdraw emission
+        let evicted = table.take_cap_evicted();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].spot.spot_key, key1);
+        assert!(table.take_cap_evicted().is_empty());
+
         // CALL4 should be present
         let key4 = make_key("CALL4", 3_525_000, DxMode::CW);
         assert!(table.get(&key4).is_some(), "new spot should be present");
@@ -903,9 +1003,10 @@ mod tests {
 
         let removed = table.remove_spot(&key);
         assert!(removed.is_some());
-        let (spot, rev) = removed.unwrap();
-        assert_eq!(spot.spot_key.dx_call_norm, "N9UNX");
-        assert_eq!(rev, 1);
+        let removed = removed.unwrap();
+        assert_eq!(removed.spot.spot_key.dx_call_norm, "N9UNX");
+        assert_eq!(removed.revision, 1);
+        assert!(!removed.was_emitted);
 
         // Index should be cleaned
         assert!(table.lookup_emitted(&cbm).is_none());

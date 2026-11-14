@@ -254,6 +254,40 @@ Each `DxSpotEvent` carries the full `DxSpot` (aggregated data, observations
 list, skimmer quality tag, confidence level) plus a monotonically increasing
 `revision` number per spot key.
 
+## Metrics
+
+`DxFeed::metrics()` returns a `DxFeedMetrics` snapshot of counters kept
+since the feed was built. It is cheap and can be polled freely.
+
+```rust,ignore
+let m = feed.metrics();
+println!(
+    "received {} gated {} filtered {} deduped {} -> new {} update {} withdraw {}",
+    m.spots_received, m.spots_gated, m.spots_filtered, m.spots_deduped,
+    m.emitted_new, m.emitted_update, m.emitted_withdraw,
+);
+```
+
+Every observation ends in exactly one outcome, so
+`spots_received = spots_gated + spots_filtered + spots_deduped + emitted_new + emitted_update`.
+
+| Field | Meaning |
+|-------|---------|
+| `spots_received` | Observations that reached the aggregator. |
+| `spots_gated`, `skimmer_gated` | Blocked by skimmer quality gating, total and by tag. |
+| `skimmer_tagged` | All skimmer observations by quality tag. |
+| `spots_filtered`, `filtered_by_reason` | Dropped by the filter, total and by `FilterDropReason`. |
+| `spots_deduped` | Passed, but the spot was already emitted. |
+| `emitted_new`, `emitted_update`, `emitted_withdraw` | Events produced for the consumer. |
+| `withdrawn` | Withdraws by reason (`expired`, `qsy`, `evicted`). |
+| `spot_table_size` | Current spots in the table (gauge). |
+| `sources` | Per source: `spots_received`, `unparsed_lines`, `reconnects`. |
+| `parse_errors`, `reconnects` | Totals across sources. |
+
+`unparsed_lines` counts lines after login that were not a spot,
+announcement, propagation report or prompt. A steadily climbing count
+against one node suggests a spot format the parser does not recognise.
+
 ## CLI
 
 A test harness binary is available behind the `cli` feature:

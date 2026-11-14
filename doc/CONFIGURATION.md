@@ -307,6 +307,7 @@ Controls how observations are aggregated into spots.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `freq_bucket` | `FreqBucketConfig` | see below | Frequency bucketing widths per mode. |
+| `match_tolerance` | `MatchToleranceConfig` | see below | How close in frequency an observation must be to an existing spot to count as that spot. |
 | `callsign_norm` | `CallsignNormalization` | see below | Callsign normalization rules (shared with filter config). |
 | `dedupe` | `DedupeConfig` | see below | Deduplication and emission control. |
 | `spot_ttl` | `Duration` | `900s` (15 min) | Time-to-live for spots. Spots not updated within this window are evicted and a `Withdraw` event is emitted. |
@@ -328,6 +329,32 @@ varies by mode:
 | `ssb_bucket_hz` | `u64` | `1000` | SSB frequency bucket width in Hz. |
 | `dig_bucket_hz` | `u64` | `100` | Digital mode frequency bucket width in Hz. |
 
+### Spot Matching (`match_tolerance`)
+
+**Type:** `MatchToleranceConfig`
+
+An observation is attached to an existing spot for the same normalized
+callsign, band and mode when its frequency is within the tolerance
+(inclusive) of the frequency at which that spot was first seen (its anchor).
+The anchor is fixed for the spot's lifetime, so a run of reports cannot walk
+a spot across the band. An observation outside the tolerance is a different
+spot; if the existing spot was already emitted, that is a QSY (`Withdraw`
+then `New`).
+
+When the already-emitted spot is within tolerance it always wins; otherwise
+the spot with the nearest anchor is used. The frequency bucket then only
+decides the key a brand-new spot is filed under.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cw_hz` | `u64` | `300` | CW tolerance in Hz. |
+| `ssb_hz` | `u64` | `1000` | SSB tolerance in Hz (also used for AM, FM and unknown modes). |
+| `dig_hz` | `u64` | `100` | Digital mode tolerance in Hz. |
+
+Setting a value to `0` disables matching for that mode and falls back to
+pure frequency bucketing. The tolerance can be changed at runtime with
+`DxFeed::set_match_tolerance()`; existing spots keep their keys.
+
 ### Deduplication (`dedupe`)
 
 **Type:** `DedupeConfig`
@@ -336,7 +363,7 @@ varies by mode:
 |-------|------|---------|-------------|
 | `emit_updates` | `bool` | `false` | When `true`, emit `Update` events when an already-emitted spot receives new observations. When `false`, only `New` and `Withdraw` events are emitted. |
 | `min_update_interval` | `Duration` or `null` | `null` | Minimum time between `Update` emissions for the same spot. Suppresses rapid-fire updates. `null` = no cooldown (every qualifying update emits). |
-| `detect_qsy` | `bool` | `true` | When `true`, if a station is spotted at a new frequency bucket on the same band/mode, the old spot is withdrawn and a new one is emitted (`[Withdraw, New]`). |
+| `detect_qsy` | `bool` | `true` | When `true`, if a station is spotted outside `match_tolerance` of its current spot on the same band/mode, the old spot is withdrawn and a new one is emitted (`[Withdraw, New]`). The pair is always emitted. |
 
 ---
 
@@ -556,6 +583,24 @@ Lifecycle state of a spot event.
 | `New` | First time this spot passes filters and is emitted. |
 | `Update` | Meaningful change to an already-emitted spot (requires `emit_updates: true`). |
 | `Withdraw` | Spot removed due to TTL expiry, QSY detection, or capacity eviction. |
+
+Per `SpotKey`, the aggregator guarantees: the first event is `New`; `Update`
+and `Withdraw` only follow a `New`; every `New` is eventually followed by
+exactly one `Withdraw` (unless the feed shuts down first); and nothing
+follows a `Withdraw` except a fresh `New`. A consumer can maintain a correct
+table from events alone. Spots that were gated or filtered and never emitted
+are removed without a `Withdraw`.
+
+### WithdrawReason
+
+`DxSpotEvent::withdraw_reason` is set on every `Withdraw` and is `None` on
+`New` and `Update`.
+
+| Value | Description |
+|-------|-------------|
+| `Expired` | No observation arrived within `spot_ttl`. |
+| `Qsy` | The station moved outside `match_tolerance`; a `New` for the new frequency follows immediately. |
+| `Evicted` | Removed to keep the table within `max_spots`. |
 
 ---
 
