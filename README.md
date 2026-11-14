@@ -3,7 +3,7 @@
 **DX cluster spot aggregation for contest loggers.**
 
 A Rust library that connects to one or more DX cluster nodes, aggregates
-spots with deduplication and frequency bucketing, applies configurable
+spots with deduplication and tolerance-based frequency matching, applies configurable
 filters, classifies skimmer quality (CT1BOH/AR-Cluster style), resolves
 DXCC entities, and emits a unified stream of `DxEvent`s. All configuration
 is hot-reloadable at runtime. Built on tokio.
@@ -83,7 +83,7 @@ Cluster Sources
     |
     v
 Aggregator
-  ├── SpotTable    (dedup, freq bucketing, TTL eviction)
+  ├── SpotTable    (dedup, freq tolerance matching, TTL eviction)
   ├── SkimmerQuality (CT1BOH-style Valid/Busted/Qsy classification)
   └── Filter       (band/mode/callsign/geo/correlation/enrichment rules)
     |
@@ -105,6 +105,7 @@ DxEvent stream  -->  your application
 | `domain` | `Band`, `DxMode`, `Continent`, `OriginatorKind`, etc. |
 | `parser` | DX spot line parser, skimmer comment field parser |
 | `freq` | Frequency-to-band/mode mapping, bucket computation |
+| `metrics` | `DxFeedMetrics` — pipeline counters via `DxFeed::metrics()` |
 | `callsign` | Normalization, portable suffix stripping, skimmer detection |
 
 ## Configuration
@@ -137,21 +138,29 @@ For the complete configuration reference, see [`doc/CONFIGURATION.md`](doc/CONFI
 
 ```rust,no_run
 use std::time::Duration;
-use dxfeed::aggregator::core::{AggregatorConfig, DedupeConfig, FreqBucketConfig};
+use dxfeed::aggregator::core::{AggregatorConfig, DedupeConfig, MatchToleranceConfig};
 
 let config = AggregatorConfig {
     spot_ttl: Duration::from_secs(900),
     max_spots: 50_000,
     max_observations_per_spot: 20,
-    freq_bucket: FreqBucketConfig {
-        cw_bucket_hz: 10,
-        ssb_bucket_hz: 1000,
-        dig_bucket_hz: 100,
+    match_tolerance: MatchToleranceConfig {
+        cw_hz: 300,
+        ssb_hz: 1000,
+        dig_hz: 100,
     },
-    dedupe: DedupeConfig { emit_updates: false },
+    dedupe: DedupeConfig {
+        emit_updates: false,
+        ..Default::default()
+    },
     ..Default::default()
 };
 ```
+
+Two reports are the same spot when they have the same callsign, band and
+mode and the new frequency is within `match_tolerance` of the frequency at
+which the spot was first seen. Outside the tolerance the station has moved:
+the old spot is withdrawn and a new one emitted.
 
 ### Skimmer Quality
 
@@ -179,6 +188,7 @@ All configuration can be updated at runtime without restarting connections:
 # use dxfeed::feed::DxFeed;
 # fn example(feed: &DxFeed) {
 use std::time::Duration;
+use dxfeed::aggregator::core::MatchToleranceConfig;
 use dxfeed::filter::config::FilterConfigSerde;
 use dxfeed::domain::Band;
 
@@ -191,6 +201,7 @@ feed.update_filter(filter).unwrap();
 feed.set_spot_ttl(Duration::from_secs(600));
 feed.set_emit_updates(true);
 feed.set_max_spots(100_000);
+feed.set_match_tolerance(MatchToleranceConfig { cw_hz: 200, ..Default::default() });
 
 // Skimmer quality tuning
 feed.set_skimmer_gate(true);
@@ -251,8 +262,19 @@ impl EnrichmentResolver for MyEnrichment {
 | `Error(DxError)` | Non-fatal error from a source or the aggregator |
 
 Each `DxSpotEvent` carries the full `DxSpot` (aggregated data, observations
-list, skimmer quality tag, confidence level) plus a monotonically increasing
-`revision` number per spot key.
+list, skimmer quality tag) plus a monotonically increasing `revision` number
+per spot key.
+
+The lifecycle is reliable: per spot key, the first event is `New`, every
+`New` is eventually followed by exactly one `Withdraw`, and nothing follows
+a `Withdraw` except a fresh `New`. A consumer can keep a correct spot table
+from events alone. Each `Withdraw` carries a `withdraw_reason`:
+
+| Reason | Meaning |
+|--------|---------|
+| `Expired` | No observation arrived within `spot_ttl`. |
+| `Qsy` | The station moved; a `New` for the new frequency follows immediately. |
+| `Evicted` | Removed to keep the table within `max_spots`. |
 
 ## Metrics
 
@@ -295,9 +317,12 @@ A test harness binary is available behind the `cli` feature:
 ```sh
 cargo run --features cli -- --callsign W1AW connect dx.example.com 7300
 cargo run --features cli -- --callsign W1AW connect dx.example.com 7300 --originator-policy all-skimmer
-cargo run --features cli -- --callsign W1AW --json --emit-updates connect dx.example.com 7300
+cargo run --features cli -- --callsign W1AW --json --metrics-interval 60 connect dx.example.com 7300
 cargo run --features cli -- --dump-default-filter > filter.json
 ```
+
+With `--json`, spot events go to stdout as one JSON object per line, and
+`--metrics-interval N` prints a metrics snapshot to stderr every N seconds.
 
 ## Requirements
 

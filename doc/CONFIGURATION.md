@@ -319,13 +319,14 @@ Controls how observations are aggregated into spots.
 
 **Type:** `FreqBucketConfig`
 
-Two observations are considered the same spot if they have the same
-normalized callsign, band, mode, and frequency bucket. The bucket size
-varies by mode:
+The bucket decides the `SpotKey` a brand-new spot is filed under. Whether a
+later observation belongs to an existing spot is decided by `match_tolerance`
+(below), not by the bucket, unless the tolerance for that mode is `0`. The
+bucket size varies by mode:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `cw_bucket_hz` | `u64` | `10` | CW frequency bucket width in Hz. Two CW spots within 10 Hz of each other (after bucketing) are the same spot. |
+| `cw_bucket_hz` | `u64` | `200` | CW frequency bucket width in Hz. |
 | `ssb_bucket_hz` | `u64` | `1000` | SSB frequency bucket width in Hz. |
 | `dig_bucket_hz` | `u64` | `100` | Digital mode frequency bucket width in Hz. |
 
