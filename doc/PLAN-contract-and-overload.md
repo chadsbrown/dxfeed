@@ -1,13 +1,12 @@
 # Plan: dxfeed contract and overload fixes
 
 Written 2026-11-14, ahead of CQ WW DX CW (Nov 28–29, 2026). Last updated
-2026-11-14, after items 1–3 and the skimmer per-band fix were merged to
-`master`.
+2026-11-27, after the recorder was written and the contest capture started.
 
 Eight items in the order they should be done. Items 1–3 are merged; items 4–8
 are open and can wait for capture data. The raw-feed recorder (see "Recorder"
-below) is not started and comes before any of the open items, because it is
-the only work with a hard deadline.
+below) is written and running for the contest; the replay tool that reads its
+output is the next piece of work.
 
 Churn figures below come from a synthetic load test (150 skimmer reports/s,
 6000 stations, 5% busted calls, skimmer gating on), not real contest data.
@@ -209,21 +208,21 @@ which belong with item 4.
 
 ## Recorder
 
-**Status: not started. Deadline: Nov 28.**
+**Status: capture tool done; replay tool not started.**
 
 - **Why:** the contest is the only source of real load data, and the
   tolerance, filter and overload decisions above all depend on it. A raw
   capture can be replayed through any later version of the aggregator; a log
   of post-filter events cannot.
-- **Change:** a tool that writes every raw line with its receive timestamp
-  from each node (RBN plus one human cluster), reconnecting on its own, and a
-  replay tool that feeds a capture through the aggregator and reports
-  metrics.
-- **Fallback with no new code:**
-  `dxfeed-cli --json --metrics-interval 60 --callsign <call> connect <host> <port> > events.jsonl`.
-  This covers one source and records post-filter events only.
-- **Before leaving it unattended:** test login against the exact nodes to be
-  used (see "Smaller findings").
+- **Capture:** `dxfeed-record` (`src/bin/dxfeed-record.rs`) writes every raw
+  line from each node with its receive timestamp to hourly JSONL files, and
+  reconnects on its own. See "Raw capture" in the README for the format.
+- **CQ WW CW 2026 capture:** started 2026-11-27 20:40Z against
+  `dxc.nc7j.com:7373` (AR-Cluster) and `w3lpl.net:7373` (DXSpider, with
+  `set/skimmer`), set to stop at 2026-11-29 00:10Z. Files are in
+  `~/dxfeed-capture/cqww-cw-2026/` on the capture machine, not in the repo.
+- **Still to do:** a replay tool that feeds a capture through the aggregator
+  with the original timing (or faster) and reports metrics.
 
 ## clogger follow-ups
 
@@ -252,9 +251,11 @@ clogger has not been changed. None of these block dxfeed work.
 - **Filtering happens after ingest.** Spots on denied bands or modes still
   occupy the table; a cheap band/mode pre-check before ingest would avoid it.
 - **Login waits for a newline-terminated prompt** (`src/source/cluster.rs`,
-  `login`). Every test sends `login:` followed by a newline; a node that
-  sends the prompt without one may loop on the 30 s login timeout. Not tested
-  against live nodes.
+  `login`). Checked against live nodes on 2026-11-27: `dxc.nc7j.com` and
+  `w3lpl.net` both send a complete line containing "callsign" before the
+  prompt, so login works. `telnet.reversebeacon.net:7000` sends only
+  `Please enter your call: ` with no line ending, and `dxfeed-cli` received
+  no spots from it in 20 s. Low priority unless RBN is used directly.
 - **Skimmer engine cap eviction picks the wrong victim.** When the engine
   hits its cap it drops the whole history of the call with the oldest first
   observation, which is likely the busiest station.

@@ -324,6 +324,33 @@ cargo run --features cli -- --dump-default-filter > filter.json
 With `--json`, spot events go to stdout as one JSON object per line, and
 `--metrics-interval N` prints a metrics snapshot to stderr every N seconds.
 
+### Raw capture
+
+`dxfeed-record` (also behind `cli`) records every line a node sends, stamped
+with the UTC time it was read from the socket, for replaying real traffic
+later. It uses none of the library's parsing or login code.
+
+```sh
+cargo run --features cli --bin dxfeed-record -- --callsign W1AW \
+    --source nodea=dx.example.com:7300 \
+    --source nodeb=dx2.example.com:7373 --send nodeb=set/skimmer \
+    --out-dir capture --stop-at 2026-11-29T00:10:00Z
+```
+
+Each source gets one JSONL file per UTC hour
+(`capture/nodea-20261128-00Z.jsonl`):
+
+```json
+{"t":"2026-11-28T00:00:00.123456Z","src":"nodea","ev":"line","data":"DX de W3LPL-#:  14025.0  K1ABC  CW 20 dB 25 WPM CQ  0000Z"}
+```
+
+`ev` is `line` for received lines; connection events (`connecting`,
+`connected`, `connect_failed`, `disconnected`), text the recorder sent
+(`sent`) and unterminated prompts (`partial`) are logged in the same file.
+Lines are decoded as Latin-1, so the original bytes are recoverable. The
+recorder reconnects after a drop or after `--silence-timeout` seconds
+(default 300) without data.
+
 ## Requirements
 
 - Rust edition 2024, MSRV **1.85**

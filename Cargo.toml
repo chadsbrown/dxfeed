@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "DX cluster spot aggregation library for contest loggers"
 license = "MIT"
+default-run = "dxfeed-cli"
 
 [features]
 default = ["serde"]
@@ -34,6 +35,10 @@ tokio-test = "0.4"
 
 [[bin]]
 name = "dxfeed-cli"
+required-features = ["cli"]
+
+[[bin]]
+name = "dxfeed-record"
 required-features = ["cli"]
 
 [[bench]]
